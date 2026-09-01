@@ -6,6 +6,7 @@ Enjoying Flow? Consider supporting its development on [Patreon](https://patreon.
 
 ## New features
 
+- 8D Spatial Audio with True 3D Room Acoustics (Schroeder-Moorer reverberation, anatomical pinna notch filtering, and Studio, Living Room, and Concert Hall acoustic spaces)
 - Discord RPC support by @PastaHimself
 - TV UI support by @PastaHimself
 - Drag left or right on the video to seek, with a toggle in Player Appearance settings
