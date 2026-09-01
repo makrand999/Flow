@@ -238,6 +238,10 @@ object EnhancedMusicPlayerManager {
                         AudioEffectsController.resolvedEq.collect { applyEqProfile(it) }
                     }
 
+                    scope.launch {
+                        AudioEffectsController.eightDConfig.collect { applyEightDConfig(it) }
+                    }
+
                     queuePersistence?.startAutoSave {
                         val currentQ = _queue.value
                         if (currentQ.isNotEmpty()) {
@@ -307,6 +311,7 @@ object EnhancedMusicPlayerManager {
                     prefetchNextTrack()
 
                     applyEqProfile(AudioEffectsController.resolvedEq.value)
+                    applyEightDConfig(AudioEffectsController.eightDConfig.value)
                 }
 
                 override fun onRepeatModeChanged(repeatMode: Int) {
@@ -1034,6 +1039,25 @@ object EnhancedMusicPlayerManager {
             }
         } catch (e: Exception) {
             Log.e("EnhancedMusicPlayer", "Error sending EQ profile", e)
+        }
+    }
+
+    private fun applyEightDConfig(config: AudioEffectsController.EightDConfig) {
+        try {
+            val bundle =
+                Bundle().apply {
+                    putBoolean("ENABLED", config.enabled)
+                    putFloat("SPEED", config.cycleDurationSec)
+                    putFloat("DEPTH", config.depth)
+                    putString("ROOM_PRESET", config.roomPreset.name)
+                }
+            val command = SessionCommand(Media3MusicService.ACTION_SET_8D_AUDIO, Bundle.EMPTY)
+
+            if (controllerFuture?.isDone == true) {
+                controllerFuture?.get()?.sendCustomCommand(command, bundle)
+            }
+        } catch (e: Exception) {
+            Log.e("EnhancedMusicPlayer", "Error sending 8D config", e)
         }
     }
 

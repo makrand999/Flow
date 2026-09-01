@@ -37,6 +37,7 @@ import io.github.aedev.flow.player.analytics.PlaybackAnalyticsLogger
 import io.github.aedev.flow.player.audio.AudioEffectsController
 import io.github.aedev.flow.player.audio.AudioFeaturesManager
 import io.github.aedev.flow.player.audio.CustomEqualizerAudioProcessor
+import io.github.aedev.flow.player.audio.Spatial8DAudioProcessor
 import io.github.aedev.flow.player.cache.PlayerCacheManager
 import io.github.aedev.flow.player.config.PlayerConfig
 import io.github.aedev.flow.player.error.PlayerDiagnostics
@@ -118,6 +119,7 @@ class EnhancedPlayerManager private constructor() {
     private var trackSelector: DefaultTrackSelector? = null
     private var bandwidthMeter: DefaultBandwidthMeter? = null
     private var videoEqualizer: CustomEqualizerAudioProcessor? = null
+    private var video8DProcessor: Spatial8DAudioProcessor? = null
     private var eqObserverStarted = false
 
     // State management
@@ -604,6 +606,14 @@ class EnhancedPlayerManager private constructor() {
                 it.applyProfile(AudioEffectsController.resolvedEq.value)
             }
         videoEqualizer = equalizer
+
+        val spatial8D =
+            Spatial8DAudioProcessor().also {
+                val cfg = AudioEffectsController.eightDConfig.value
+                it.applyConfig(cfg.enabled, cfg.cycleDurationSec, cfg.depth, cfg.roomPreset)
+            }
+        video8DProcessor = spatial8D
+
         if (!eqObserverStarted) {
             eqObserverStarted = true
             scope.launch {
@@ -611,8 +621,13 @@ class EnhancedPlayerManager private constructor() {
                     videoEqualizer?.applyProfile(profile)
                 }
             }
+            scope.launch {
+                AudioEffectsController.eightDConfig.collect { config ->
+                    video8DProcessor?.applyConfig(config.enabled, config.cycleDurationSec, config.depth, config.roomPreset)
+                }
+            }
         }
-        val renderersFactory = playerFactory.createRenderersFactory(context, arrayOf(equalizer))
+        val renderersFactory = playerFactory.createRenderersFactory(context, arrayOf(equalizer, spatial8D))
 
         player =
             playerFactory.createPlayer(

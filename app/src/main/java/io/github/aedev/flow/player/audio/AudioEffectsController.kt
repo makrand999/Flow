@@ -59,6 +59,35 @@ object AudioEffectsController {
     private val _customPresets = MutableStateFlow<Map<String, ParametricEQ>>(emptyMap())
     val customPresets: StateFlow<Map<String, ParametricEQ>> = _customPresets.asStateFlow()
 
+    data class EightDConfig(
+        val enabled: Boolean = false,
+        val cycleDurationSec: Float = 14.0f,
+        val depth: Float = 0.75f,
+        val roomPreset: EightDRoomPreset = EightDRoomPreset.LIVING_ROOM,
+    )
+
+    private val _eightDEnabled = MutableStateFlow(false)
+    val eightDEnabled: StateFlow<Boolean> = _eightDEnabled.asStateFlow()
+
+    private val _eightDSpeed = MutableStateFlow(14.0f)
+    val eightDSpeed: StateFlow<Float> = _eightDSpeed.asStateFlow()
+
+    private val _eightDDepth = MutableStateFlow(0.75f)
+    val eightDDepth: StateFlow<Float> = _eightDDepth.asStateFlow()
+
+    private val _eightDRoomPreset = MutableStateFlow(EightDRoomPreset.LIVING_ROOM)
+    val eightDRoomPreset: StateFlow<EightDRoomPreset> = _eightDRoomPreset.asStateFlow()
+
+    val eightDConfig: StateFlow<EightDConfig> =
+        combine(
+            _eightDEnabled,
+            _eightDSpeed,
+            _eightDDepth,
+            _eightDRoomPreset,
+        ) { enabled, speed, depth, room ->
+            EightDConfig(enabled, speed, depth, room)
+        }.stateIn(scope, SharingStarted.Eagerly, EightDConfig())
+
     /** The profile the audio pipelines should actually run: selected preset + bass boost folded in. */
     val resolvedEq: StateFlow<ParametricEQ> =
         combine(
@@ -86,9 +115,13 @@ object AudioEffectsController {
                 val settings = store.settingsFlow.first()
                 _bassBoost.value = settings.bassBoost
                 _eqProfileName.value = settings.eqProfile
+                _eightDEnabled.value = settings.eightDEnabled
+                _eightDSpeed.value = settings.eightDSpeed
+                _eightDDepth.value = settings.eightDDepth
+                _eightDRoomPreset.value = EightDRoomPreset.fromString(settings.eightDRoomPreset)
                 Log.d(
                     TAG,
-                    "Restored EQ state: profile=${settings.eqProfile}, bass=${settings.bassBoost}, customPresets=${_customPresets.value.keys}",
+                    "Restored audio effects state: profile=${settings.eqProfile}, bass=${settings.bassBoost}, 8D=${settings.eightDEnabled}, room=${settings.eightDRoomPreset}, customPresets=${_customPresets.value.keys}",
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to restore EQ state", e)
@@ -112,6 +145,26 @@ object AudioEffectsController {
     fun setBassBoost(strength: Float) {
         _bassBoost.value = strength
         scope.launch { persistence?.saveBassBoost(strength) }
+    }
+
+    fun setEightDEnabled(enabled: Boolean) {
+        _eightDEnabled.value = enabled
+        scope.launch { persistence?.saveEightDEnabled(enabled) }
+    }
+
+    fun setEightDSpeed(speedSec: Float) {
+        _eightDSpeed.value = speedSec
+        scope.launch { persistence?.saveEightDSpeed(speedSec) }
+    }
+
+    fun setEightDDepth(depth: Float) {
+        _eightDDepth.value = depth
+        scope.launch { persistence?.saveEightDDepth(depth) }
+    }
+
+    fun setEightDRoomPreset(preset: EightDRoomPreset) {
+        _eightDRoomPreset.value = preset
+        scope.launch { persistence?.saveEightDRoomPreset(preset.name) }
     }
 
     /**

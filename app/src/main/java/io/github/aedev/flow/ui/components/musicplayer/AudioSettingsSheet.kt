@@ -93,6 +93,12 @@ fun AudioSettingsSheet(onDismiss: () -> Unit) {
                     }
                 }
 
+                // --- 8D Spatial Audio ---
+                item {
+                    io.github.aedev.flow.ui.components.audio
+                        .EightDAudioCard()
+                }
+
                 // --- Equalizer (shared with the video player) ---
                 item {
                     EqualizerEditor()

@@ -46,6 +46,8 @@ import io.github.aedev.flow.extensions.setOffloadEnabled
 import io.github.aedev.flow.innertube.YouTube
 import io.github.aedev.flow.innertube.models.WatchEndpoint
 import io.github.aedev.flow.player.audio.CustomEqualizerAudioProcessor
+import io.github.aedev.flow.player.audio.EightDRoomPreset
+import io.github.aedev.flow.player.audio.Spatial8DAudioProcessor
 import io.github.aedev.flow.player.audio.shouldHandleAudioFocus
 import io.github.aedev.flow.player.factory.LoadControlFactory
 import io.github.aedev.flow.utils.MusicPlayerUtils
@@ -62,10 +64,13 @@ import java.util.Locale
 import javax.inject.Inject
 import kotlin.math.min
 
+@UnstableApi
 @AndroidEntryPoint
 class Media3MusicService : MediaLibraryService() {
     companion object {
         private const val TAG = "Media3MusicService"
+        private const val NOTIFICATION_ID = 1001
+        private const val CHANNEL_ID = "flow_music_channel"
         private const val ACTION_TOGGLE_SHUFFLE = "ACTION_TOGGLE_SHUFFLE"
         private const val ACTION_TOGGLE_REPEAT = "ACTION_TOGGLE_REPEAT"
         private const val ACTION_STOP = "ACTION_STOP"
@@ -73,6 +78,7 @@ class Media3MusicService : MediaLibraryService() {
         private const val AUTO_QUEUE_ID = "flow_auto_queue"
         private const val AUTO_CURRENT_ID = "flow_auto_current"
         const val ACTION_SET_EQ = "ACTION_SET_EQ"
+        const val ACTION_SET_8D_AUDIO = "ACTION_SET_8D_AUDIO"
 
         private const val MAX_RETRY_PER_SONG = 5
         private const val BASE_RETRY_DELAY_MS = 3000L
@@ -92,6 +98,7 @@ class Media3MusicService : MediaLibraryService() {
         private val CommandToggleRepeat = SessionCommand(ACTION_TOGGLE_REPEAT, Bundle.EMPTY)
         private val CommandStop = SessionCommand(ACTION_STOP, Bundle.EMPTY)
         private val CommandSetEq = SessionCommand(ACTION_SET_EQ, Bundle.EMPTY)
+        private val CommandSet8DAudio = SessionCommand(ACTION_SET_8D_AUDIO, Bundle.EMPTY)
 
         const val ACTION_TOGGLE_LIKE = "ACTION_TOGGLE_LIKE"
         private val CommandToggleLike = SessionCommand(ACTION_TOGGLE_LIKE, Bundle.EMPTY)
@@ -109,6 +116,7 @@ class Media3MusicService : MediaLibraryService() {
     private lateinit var mediaLibrarySession: MediaLibrarySession
     private lateinit var player: ExoPlayer
     private val customEqualizer = CustomEqualizerAudioProcessor()
+    private val spatial8DProcessor = Spatial8DAudioProcessor()
     private val musicAudioAttributes =
         AudioAttributes
             .Builder()
@@ -276,7 +284,7 @@ class Media3MusicService : MediaLibraryService() {
                 ): androidx.media3.exoplayer.audio.AudioSink? =
                     androidx.media3.exoplayer.audio.DefaultAudioSink
                         .Builder(context)
-                        .setAudioProcessors(arrayOf(customEqualizer))
+                        .setAudioProcessors(arrayOf(customEqualizer, spatial8DProcessor))
                         .build()
             }.setExtensionRendererMode(androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
 
@@ -1389,6 +1397,7 @@ class Media3MusicService : MediaLibraryService() {
                     .add(CommandToggleLike)
                     .add(CommandStop)
                     .add(CommandSetEq)
+                    .add(CommandSet8DAudio)
                     .build()
             return MediaSession.ConnectionResult
                 .AcceptedResultBuilder(session)
@@ -1418,6 +1427,16 @@ class Media3MusicService : MediaLibraryService() {
                         android.util.Log.e(TAG, "Failed to apply EQ profile", e)
                     }
                 }
+                return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+            }
+
+            if (customCommand.customAction == ACTION_SET_8D_AUDIO) {
+                val enabled = args.getBoolean("ENABLED", false)
+                val speed = args.getFloat("SPEED", 14.0f)
+                val depth = args.getFloat("DEPTH", 0.75f)
+                val roomStr = args.getString("ROOM_PRESET", "LIVING_ROOM")
+                val roomPreset = EightDRoomPreset.fromString(roomStr)
+                spatial8DProcessor.applyConfig(enabled, speed, depth, roomPreset)
                 return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
             }
 

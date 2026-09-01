@@ -12,8 +12,9 @@ import kotlinx.coroutines.flow.map
 
 private val Context.audioSettingsDataStore: DataStore<Preferences> by safePreferencesDataStore(name = "audio_settings")
 
-class AudioSettingsPersistence private constructor(private val context: Context) {
-
+class AudioSettingsPersistence private constructor(
+    private val context: Context,
+) {
     companion object {
         private val PITCH_KEY = floatPreferencesKey("pitch_level")
         private val SPEED_KEY = floatPreferencesKey("speed_level")
@@ -23,15 +24,18 @@ class AudioSettingsPersistence private constructor(private val context: Context)
         private val VOLUME_MULTIPLIER_KEY = floatPreferencesKey("volume_multiplier")
         private val CUSTOM_EQ_KEY = stringPreferencesKey("custom_eq_profile_json")
         private val CUSTOM_PRESETS_KEY = stringPreferencesKey("custom_eq_presets_json")
+        private val EIGHT_D_ENABLED_KEY = booleanPreferencesKey("eight_d_enabled")
+        private val EIGHT_D_SPEED_KEY = floatPreferencesKey("eight_d_speed")
+        private val EIGHT_D_DEPTH_KEY = floatPreferencesKey("eight_d_depth")
+        private val EIGHT_D_ROOM_KEY = stringPreferencesKey("eight_d_room_preset")
 
         @Volatile
-        private var INSTANCE: AudioSettingsPersistence? = null
+        private var instance: AudioSettingsPersistence? = null
 
-        fun getInstance(context: Context): AudioSettingsPersistence {
-            return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: AudioSettingsPersistence(context.applicationContext).also { INSTANCE = it }
+        fun getInstance(context: Context): AudioSettingsPersistence =
+            instance ?: synchronized(this) {
+                instance ?: AudioSettingsPersistence(context.applicationContext).also { instance = it }
             }
-        }
     }
 
     data class AudioSettings(
@@ -40,20 +44,29 @@ class AudioSettingsPersistence private constructor(private val context: Context)
         val eqProfile: String = "Flat",
         val bassBoost: Float = 0f,
         val virtualizer: Float = 0f,
-        val volumeMultiplier: Float = 1.0f
+        val volumeMultiplier: Float = 1.0f,
+        val eightDEnabled: Boolean = false,
+        val eightDSpeed: Float = 14.0f,
+        val eightDDepth: Float = 0.75f,
+        val eightDRoomPreset: String = "LIVING_ROOM",
     )
 
-    val settingsFlow: Flow<AudioSettings> = context.audioSettingsDataStore.data
-        .map { preferences ->
-            AudioSettings(
-                pitch = preferences[PITCH_KEY] ?: 0.0f,
-                speed = preferences[SPEED_KEY] ?: 1.0f,
-                eqProfile = preferences[EQ_PROFILE_KEY] ?: "Flat",
-                bassBoost = preferences[BASS_BOOST_KEY] ?: 0f,
-                virtualizer = preferences[VIRTUALIZER_KEY] ?: 0f,
-                volumeMultiplier = preferences[VOLUME_MULTIPLIER_KEY] ?: 1.0f
-            )
-        }
+    val settingsFlow: Flow<AudioSettings> =
+        context.audioSettingsDataStore.data
+            .map { preferences ->
+                AudioSettings(
+                    pitch = preferences[PITCH_KEY] ?: 0.0f,
+                    speed = preferences[SPEED_KEY] ?: 1.0f,
+                    eqProfile = preferences[EQ_PROFILE_KEY] ?: "Flat",
+                    bassBoost = preferences[BASS_BOOST_KEY] ?: 0f,
+                    virtualizer = preferences[VIRTUALIZER_KEY] ?: 0f,
+                    volumeMultiplier = preferences[VOLUME_MULTIPLIER_KEY] ?: 1.0f,
+                    eightDEnabled = preferences[EIGHT_D_ENABLED_KEY] ?: false,
+                    eightDSpeed = preferences[EIGHT_D_SPEED_KEY] ?: 14.0f,
+                    eightDDepth = preferences[EIGHT_D_DEPTH_KEY] ?: 0.75f,
+                    eightDRoomPreset = preferences[EIGHT_D_ROOM_KEY] ?: "LIVING_ROOM",
+                )
+            }
 
     suspend fun savePitch(pitch: Float) {
         context.audioSettingsDataStore.edit { it[PITCH_KEY] = pitch }
@@ -70,7 +83,7 @@ class AudioSettingsPersistence private constructor(private val context: Context)
     suspend fun saveBassBoost(strength: Float) {
         context.audioSettingsDataStore.edit { it[BASS_BOOST_KEY] = strength }
     }
-    
+
     suspend fun saveVirtualizer(strength: Float) {
         context.audioSettingsDataStore.edit { it[VIRTUALIZER_KEY] = strength }
     }
@@ -79,11 +92,29 @@ class AudioSettingsPersistence private constructor(private val context: Context)
         context.audioSettingsDataStore.edit { it[VOLUME_MULTIPLIER_KEY] = multiplier }
     }
 
-    val customEqJsonFlow: Flow<String?> = context.audioSettingsDataStore.data
-        .map { it[CUSTOM_EQ_KEY] }
+    suspend fun saveEightDEnabled(enabled: Boolean) {
+        context.audioSettingsDataStore.edit { it[EIGHT_D_ENABLED_KEY] = enabled }
+    }
 
-    val customPresetsJsonFlow: Flow<String?> = context.audioSettingsDataStore.data
-        .map { it[CUSTOM_PRESETS_KEY] }
+    suspend fun saveEightDSpeed(speed: Float) {
+        context.audioSettingsDataStore.edit { it[EIGHT_D_SPEED_KEY] = speed }
+    }
+
+    suspend fun saveEightDDepth(depth: Float) {
+        context.audioSettingsDataStore.edit { it[EIGHT_D_DEPTH_KEY] = depth }
+    }
+
+    suspend fun saveEightDRoomPreset(preset: String) {
+        context.audioSettingsDataStore.edit { it[EIGHT_D_ROOM_KEY] = preset }
+    }
+
+    val customEqJsonFlow: Flow<String?> =
+        context.audioSettingsDataStore.data
+            .map { it[CUSTOM_EQ_KEY] }
+
+    val customPresetsJsonFlow: Flow<String?> =
+        context.audioSettingsDataStore.data
+            .map { it[CUSTOM_PRESETS_KEY] }
 
     suspend fun saveCustomEqJson(json: String) {
         context.audioSettingsDataStore.edit { it[CUSTOM_EQ_KEY] = json }

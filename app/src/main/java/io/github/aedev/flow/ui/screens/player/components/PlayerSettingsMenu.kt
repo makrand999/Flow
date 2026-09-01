@@ -462,12 +462,17 @@ fun SettingsMenuDialog(
                         }
 
                         PlayerSettingsPage.Equalizer -> {
-                            EqualizerEditor(
+                            Column(
                                 modifier =
                                     Modifier
                                         .padding(horizontal = 20.dp)
                                         .padding(top = 8.dp, bottom = 16.dp),
-                            )
+                                verticalArrangement = Arrangement.spacedBy(16.dp),
+                            ) {
+                                io.github.aedev.flow.ui.components.audio
+                                    .EightDAudioCard()
+                                EqualizerEditor()
+                            }
                         }
 
                         PlayerSettingsPage.Subtitles -> {

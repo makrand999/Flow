@@ -1790,6 +1790,17 @@
     <string name="equalizer">Equalizer</string>
     <string name="action_save_preset">Save preset</string>
     <string name="label_preset_name">Preset name</string>
+    <string name="label_eight_d_audio">8D Spatial Audio</string>
+    <string name="eight_d_audio_description">360° dynamic rotating surround sound illusion</string>
+    <string name="eight_d_headphones_recommended">Headphones recommended</string>
+    <string name="label_eight_d_speed">Rotation speed</string>
+    <string name="template_eight_d_speed">Cycle: %1$ds</string>
+    <string name="label_eight_d_depth">Spatial intensity</string>
+    <string name="template_eight_d_depth">Intensity: %1$d%%</string>
+    <string name="label_eight_d_room_acoustics">Room Acoustics</string>
+    <string name="eight_d_room_studio">Studio</string>
+    <string name="eight_d_room_living_room">Living Room</string>
+    <string name="eight_d_room_concert_hall">Concert Hall</string>
     <!-- Player -->
     <string name="now_playing">NOW PLAYING</string>
     <!-- Music Search Screen -->
