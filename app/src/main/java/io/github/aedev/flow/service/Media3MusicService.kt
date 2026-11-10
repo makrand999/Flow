@@ -557,16 +557,16 @@ class Media3MusicService : MediaLibraryService() {
         processor: EqualizerAudioProcessor,
         spatial: Spatial8DAudioProcessor,
     ) = object : androidx.media3.exoplayer.DefaultRenderersFactory(this) {
-            override fun buildAudioSink(
-                context: android.content.Context,
-                enableFloatOutput: Boolean,
-                enableAudioTrackPlaybackParams: Boolean,
-            ): androidx.media3.exoplayer.audio.AudioSink? =
-                androidx.media3.exoplayer.audio.DefaultAudioSink
-                    .Builder(context)
-                    .setAudioProcessors(arrayOf(processor, spatial))
-                    .build()
-        }.setExtensionRendererMode(androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+        override fun buildAudioSink(
+            context: android.content.Context,
+            enableFloatOutput: Boolean,
+            enableAudioTrackPlaybackParams: Boolean,
+        ): androidx.media3.exoplayer.audio.AudioSink? =
+            androidx.media3.exoplayer.audio.DefaultAudioSink
+                .Builder(context)
+                .setAudioProcessors(arrayOf(processor, spatial))
+                .build()
+    }.setExtensionRendererMode(androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
 
     private fun initializePlayer() {
         musicSourceFactory =
