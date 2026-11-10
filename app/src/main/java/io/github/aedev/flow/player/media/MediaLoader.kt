@@ -14,15 +14,13 @@ import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.LoadEventInfo
-import androidx.media3.exoplayer.source.MediaLoadData
 import androidx.media3.exoplayer.source.MediaSource
-import androidx.media3.exoplayer.source.MediaSourceEventListener
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.source.SingleSampleMediaSource
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
+import androidx.media3.extractor.DefaultExtractorsFactory
 import io.github.aedev.flow.R
 import io.github.aedev.flow.player.cache.PlayerCacheManager
 import io.github.aedev.flow.player.config.PlayerConfig
@@ -33,16 +31,14 @@ import io.github.aedev.flow.player.sabr.integration.SabrMediaSourceResult
 import io.github.aedev.flow.player.sabr.integration.SabrOrchestrator
 import io.github.aedev.flow.player.sabr.integration.SabrStreamInfo
 import io.github.aedev.flow.player.state.EnhancedPlayerState
+import io.github.aedev.flow.player.stream.ResolvedCaption
 import io.github.aedev.flow.player.stream.StreamProcessor
 import io.github.aedev.flow.player.stream.VideoCodecUtils
 import io.github.aedev.flow.player.surface.SurfaceManager
 import kotlinx.coroutines.flow.MutableStateFlow
-import org.schabi.newpipe.extractor.MediaFormat
 import org.schabi.newpipe.extractor.stream.AudioStream
-import org.schabi.newpipe.extractor.stream.SubtitlesStream
 import org.schabi.newpipe.extractor.stream.VideoStream
 import java.io.File
-import java.io.IOException
 import java.util.Locale
 
 /**
@@ -67,15 +63,34 @@ class MediaLoader(
             MimeTypes.registerCustomMimeType(Srv3SubtitleParser.MIME_TYPE, "", C.TRACK_TYPE_TEXT)
         }
 
-        internal fun subtitleTrackId(index: Int): String = "flow-subtitle-$index"
+        private const val SUBTITLE_TRACK_ID_PREFIX = "flow-subtitle-"
+        private val SubtitleTrackIdPattern = Regex("""(?:^|:)$SUBTITLE_TRACK_ID_PREFIX(\d+)$""")
+
+        internal fun subtitleTrackId(index: Int): String = "$SUBTITLE_TRACK_ID_PREFIX$index"
+
+        /**
+         * The caption index a track's format id names, or null for a track Flow did not add.
+         * Merging sources prefix every format id with the source's position, so the id is matched
+         * at its end.
+         */
+        internal fun subtitleTrackIndex(formatId: String?): Int? =
+            formatId
+                ?.let { SubtitleTrackIdPattern.find(it) }
+                ?.groupValues
+                ?.get(1)
+                ?.toIntOrNull()
     }
 
     private var activeSabrOrchestrator: SabrOrchestrator? = null
     private var lastSourceWasSabr = false
+
+    /** Whether the media last loaded is a quality ladder that Media3 adapts over by itself. */
+    var lastSourceWasAdaptiveLadder = false
+        private set
     var onSabrFallbackNeeded: (() -> Unit)? = null
 
-    /** Invoked with a subtitle track's display label once its fetch has finally given up. */
-    var onSubtitleLoadFailed: ((String) -> Unit)? = null
+    /** Invoked with a subtitle track's index and display label once its fetch has finally given up. */
+    var onSubtitleLoadFailed: ((Int, String) -> Unit)? = null
 
     /**
      * Load media with video and audio streams.
@@ -110,7 +125,7 @@ class MediaLoader(
         localFilePath: String? = null,
         audioOnly: Boolean = false,
         playWhenReady: Boolean = true,
-        subtitleStreams: List<SubtitlesStream> = emptyList(),
+        captions: List<ResolvedCaption> = emptyList(),
         sabrInfo: SabrStreamInfo? = null,
         sabrVideoId: String? = null,
         sabrPreferred: Boolean = false,
@@ -118,6 +133,7 @@ class MediaLoader(
         innerTubeAudioFormats: List<io.github.aedev.flow.innertube.models.response.PlayerResponse.StreamingData.Format> = emptyList(),
         mediaId: String = "",
         mediaMetadata: MediaMetadata = MediaMetadata.EMPTY,
+        adaptiveLadder: List<VideoStream> = emptyList(),
     ): Boolean {
         val finalDuration =
             when {
@@ -152,6 +168,7 @@ class MediaLoader(
                 Log.d(TAG, "Resolving media with VideoPlaybackResolver for duration ${finalDuration}s")
 
                 lastSourceWasSabr = false
+                lastSourceWasAdaptiveLadder = false
                 val mediaSource =
                     createMediaSource(
                         context = ctx,
@@ -166,7 +183,7 @@ class MediaLoader(
                         finalDuration = finalDuration,
                         localFilePath = localFilePath,
                         audioOnly = audioOnly,
-                        subtitleStreams = subtitleStreams,
+                        captions = captions,
                         sabrInfo = sabrInfo,
                         sabrVideoId = sabrVideoId,
                         sabrPreferred = sabrPreferred,
@@ -175,6 +192,8 @@ class MediaLoader(
                         innerTubeAudioFormats = innerTubeAudioFormats,
                         mediaId = mediaId,
                         mediaMetadata = mediaMetadata,
+                        adaptiveLadder = adaptiveLadder,
+                        onAdaptiveLadder = { lastSourceWasAdaptiveLadder = it },
                     )
 
                 if (mediaSource != null) {
@@ -215,9 +234,10 @@ class MediaLoader(
         availableVideoStreams: List<VideoStream>,
         dashManifestUrl: String?,
         durationSeconds: Long,
-        subtitleStreams: List<SubtitlesStream> = emptyList(),
+        captions: List<ResolvedCaption> = emptyList(),
         mediaId: String = "",
         mediaMetadata: MediaMetadata = MediaMetadata.EMPTY,
+        adaptiveLadder: List<VideoStream> = emptyList(),
     ): MediaSource? {
         val ctx = context ?: return null
         val dataSourceFactory = cacheManager?.getDataSourceFactory() ?: DefaultDataSource.Factory(ctx)
@@ -235,9 +255,10 @@ class MediaLoader(
                 finalDuration = durationSeconds,
                 localFilePath = null,
                 audioOnly = false,
-                subtitleStreams = subtitleStreams,
+                captions = captions,
                 mediaId = mediaId,
                 mediaMetadata = mediaMetadata,
+                adaptiveLadder = adaptiveLadder,
             )
         } catch (e: Exception) {
             Log.w(TAG, "buildPreloadMediaSource failed", e)
@@ -274,7 +295,7 @@ class MediaLoader(
         finalDuration: Long,
         localFilePath: String?,
         audioOnly: Boolean,
-        subtitleStreams: List<SubtitlesStream>,
+        captions: List<ResolvedCaption>,
         sabrInfo: SabrStreamInfo? = null,
         sabrVideoId: String? = null,
         sabrPreferred: Boolean = false,
@@ -283,7 +304,17 @@ class MediaLoader(
         innerTubeAudioFormats: List<io.github.aedev.flow.innertube.models.response.PlayerResponse.StreamingData.Format> = emptyList(),
         mediaId: String = "",
         mediaMetadata: MediaMetadata = MediaMetadata.EMPTY,
+        adaptiveLadder: List<VideoStream> = emptyList(),
+        onAdaptiveLadder: (Boolean) -> Unit = {},
     ): MediaSource? {
+        cacheManager?.registerStreams(
+            videoId = mediaId,
+            urls =
+                availableVideoStreams.map { it.content } +
+                    listOfNotNull(videoStream?.content, currentVideoStream?.content, audioStream?.content) +
+                    innerTubeVideoFormats.map { it.url } +
+                    innerTubeAudioFormats.map { it.url },
+        )
         val sabrAvailable =
             sabrInfo != null && sabrInfo.streamingUrl.isNotEmpty() &&
                 sabrVideoId != null && sabrInfo.audioItag > 0 && sabrInfo.videoItag > 0
@@ -298,7 +329,7 @@ class MediaLoader(
                 startPositionMs,
                 mediaId,
                 mediaMetadata,
-            )?.let { return mergeSubtitleSourcesIfNeeded(it, subtitleStreams, dataSourceFactory, context) }
+            )?.let { return mergeSubtitleSourcesIfNeeded(it, captions, dataSourceFactory, context) }
         }
 
         val mediaSource =
@@ -317,8 +348,13 @@ class MediaLoader(
                         .setMediaMetadata(mediaMetadata)
                         .apply { localFileMimeType(localUri)?.let(::setMimeType) }
                         .build()
+
+                // Tracks inside the file reach the text renderer untranscoded, so they are decoded
+                // by the same shifting decoders as sidecar files and follow the subtitle timing.
+                @Suppress("DEPRECATION")
+                val extractors = DefaultExtractorsFactory().experimentalSetTextTrackTranscodingEnabled(false)
                 ProgressiveMediaSource
-                    .Factory(DefaultDataSource.Factory(context))
+                    .Factory(DefaultDataSource.Factory(context), extractors)
                     .createMediaSource(localItem)
             } else {
                 val resolver =
@@ -335,9 +371,12 @@ class MediaLoader(
                         mediaMetadata = mediaMetadata,
                     )
 
+                val useLadder = !audioOnly && adaptiveLadder.size > 1
                 val selectedStreams =
                     if (audioOnly) {
                         emptyList()
+                    } else if (useLadder) {
+                        adaptiveLadder
                     } else if (videoStream != null) {
                         listOf(videoStream)
                     } else if (!dashManifestUrl.isNullOrEmpty() && availableVideoStreams.size > 1) {
@@ -353,14 +392,16 @@ class MediaLoader(
                         )}p"
                     }}",
                 )
-                resolver.resolve(
-                    selectedStreams,
-                    audioStream,
-                    dashManifestUrl = if (audioOnly) null else dashManifestUrl,
-                    hlsUrl = if (audioOnly) null else hlsUrl,
-                    durationSeconds = finalDuration,
-                    isLiveStream = isLiveStream && !audioOnly,
-                )
+                resolver
+                    .resolve(
+                        selectedStreams,
+                        audioStream,
+                        dashManifestUrl = if (audioOnly) null else dashManifestUrl,
+                        hlsUrl = if (audioOnly) null else hlsUrl,
+                        durationSeconds = finalDuration,
+                        isLiveStream = isLiveStream && !audioOnly,
+                        asAdaptiveLadder = useLadder,
+                    ).also { onAdaptiveLadder(resolver.resolvedAdaptiveLadder) }
             }
 
         if (mediaSource == null && sabrAvailable && !sabrPreferred) {
@@ -372,10 +413,10 @@ class MediaLoader(
                 startPositionMs,
                 mediaId,
                 mediaMetadata,
-            )?.let { return mergeSubtitleSourcesIfNeeded(it, subtitleStreams, dataSourceFactory, context) }
+            )?.let { return mergeSubtitleSourcesIfNeeded(it, captions, dataSourceFactory, context) }
         }
 
-        return mergeSubtitleSourcesIfNeeded(mediaSource, subtitleStreams, dataSourceFactory, context)
+        return mergeSubtitleSourcesIfNeeded(mediaSource, captions, dataSourceFactory, context)
     }
 
     private fun localFileMimeType(uri: Uri): String? =
@@ -427,29 +468,29 @@ class MediaLoader(
 
     private fun mergeSubtitleSourcesIfNeeded(
         mediaSource: MediaSource?,
-        subtitleStreams: List<SubtitlesStream>,
+        captions: List<ResolvedCaption>,
         dataSourceFactory: DataSource.Factory,
         context: Context,
     ): MediaSource? {
-        if (mediaSource == null || subtitleStreams.isEmpty()) return mediaSource
+        if (mediaSource == null || captions.isEmpty()) return mediaSource
 
         val localDataSourceFactory by lazy { DefaultDataSource.Factory(context) }
 
         val subtitleSources =
-            subtitleStreams.mapIndexedNotNull { index, subtitleStream ->
-                val subtitleUrl = subtitleStream.getContent().takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null
+            captions.mapIndexedNotNull { index, caption ->
+                val subtitleUrl = caption.url.takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null
                 val uri = Uri.parse(subtitleUrl)
-                val language = subtitleStream.languageTag ?: subtitleStream.locale?.toLanguageTag()
-                val label = subtitleStream.displayLanguageName ?: language ?: "Unknown"
+                val language = caption.languageTag.takeIf { it.isNotBlank() }
+                val label = caption.label ?: language ?: "Unknown"
                 val subtitleConfig =
                     MediaItem.SubtitleConfiguration
                         .Builder(uri)
-                        .setMimeType(resolveSubtitleMimeType(subtitleStream))
+                        .setMimeType(caption.format.mimeType)
                         .setLanguage(language)
-                        .setLabel(if (subtitleStream.isAutoGenerated) "$label (Auto)" else label)
+                        .setLabel(if (caption.isAutoGenerated) "$label (Auto)" else label)
                         .setSelectionFlags(0)
                         .setRoleFlags(
-                            if (subtitleStream.isAutoGenerated) {
+                            if (caption.isAutoGenerated) {
                                 C.ROLE_FLAG_SUBTITLE or C.ROLE_FLAG_TRANSCRIBES_DIALOG
                             } else {
                                 C.ROLE_FLAG_SUBTITLE
@@ -465,7 +506,7 @@ class MediaLoader(
                     }
                 SingleSampleMediaSource
                     .Factory(factory)
-                    .setLoadErrorHandlingPolicy(SubtitleLoadErrorHandlingPolicy())
+                    .setLoadErrorHandlingPolicy(SubtitleLoadErrorHandlingPolicy(caption.isTranslated))
                     // Stays true: a propagated subtitle error would surface as a fatal
                     // ExoPlaybackException and stop the video over a failed sidecar text track.
                     .setTreatLoadErrorsAsEndOfStream(true)
@@ -473,7 +514,9 @@ class MediaLoader(
                     .also { source ->
                         source.addEventListener(
                             Handler(Looper.getMainLooper()),
-                            subtitleLoadFailureReporter(label),
+                            subtitleLoadFailureReporter(index, label, subtitleUrl) { failedIndex, failedLabel ->
+                                onSubtitleLoadFailed?.invoke(failedIndex, failedLabel)
+                            },
                         )
                     }
             }
@@ -488,66 +531,6 @@ class MediaLoader(
             *subtitleSources.toTypedArray(),
         )
     }
-
-    /**
-     * Reports a subtitle fetch that has run out of retries.
-     *
-     * `treatLoadErrorsAsEndOfStream` turns that failure into an empty track, so without this the
-     * user picks a language and simply gets nothing, with no clue that anything went wrong.
-     * `wasCanceled` is Media3's signal that the loader chose not to retry, i.e. this is final.
-     */
-    private fun subtitleLoadFailureReporter(label: String): MediaSourceEventListener =
-        object : MediaSourceEventListener {
-            override fun onLoadError(
-                windowIndex: Int,
-                mediaPeriodId: MediaSource.MediaPeriodId?,
-                loadEventInfo: LoadEventInfo,
-                mediaLoadData: MediaLoadData,
-                error: IOException,
-                wasCanceled: Boolean,
-            ) {
-                val status = (error as? HttpDataSource.InvalidResponseCodeException)?.responseCode
-                if (!wasCanceled) {
-                    Log.d(TAG, "Subtitle '$label' load failed (status=$status), retrying")
-                    return
-                }
-                Log.w(TAG, "Subtitle '$label' gave up after retries (status=$status): ${error.message}")
-                onSubtitleLoadFailed?.invoke(label)
-            }
-        }
-
-    private fun resolveSubtitleMimeType(subtitleStream: SubtitlesStream): String {
-        val url = subtitleStream.getContent().lowercase(Locale.ROOT)
-
-        // Checked before subtitleStream.format.mimeType below: NewPipeExtractor gives every
-        // TRANSCRIPT* format the same generic XML mimeType, which would otherwise route srv3 to the
-        // TTML decoder — a decoder that can't parse YouTube's schema. The URL check covers streams
-        // reaching us from the NewPipe extraction path, which sets no TRANSCRIPT3 format.
-        if (subtitleStream.format == MediaFormat.TRANSCRIPT3 || "fmt=srv3" in url) return Srv3SubtitleParser.MIME_TYPE
-
-        subtitleStream.format
-            ?.mimeType
-            ?.takeIf { it.isNotBlank() }
-            ?.let { return it }
-
-        return when {
-            ".vtt" in url || "fmt=vtt" in url -> {
-                MimeTypes.TEXT_VTT
-            }
-
-            ".srt" in url || "fmt=srt" in url -> {
-                MimeTypes.APPLICATION_SUBRIP
-            }
-
-            ".ttml" in url || ".xml" in url || "fmt=ttml" in url -> {
-                MimeTypes.APPLICATION_TTML
-            }
-
-            else -> {
-                MimeTypes.TEXT_VTT
-            }
-        }
-    }
 }
 
 /**
@@ -560,8 +543,10 @@ class MediaLoader(
  * usually rides it out. Statuses that retrying cannot fix are given up on immediately.
  */
 @UnstableApi
-private class SubtitleLoadErrorHandlingPolicy : DefaultLoadErrorHandlingPolicy() {
-    override fun getMinimumLoadableRetryCount(dataType: Int): Int = MAX_ATTEMPTS
+private class SubtitleLoadErrorHandlingPolicy(
+    private val isTranslated: Boolean,
+) : DefaultLoadErrorHandlingPolicy() {
+    override fun getMinimumLoadableRetryCount(dataType: Int): Int = if (isTranslated) TRANSLATED_MAX_ATTEMPTS else MAX_ATTEMPTS
 
     override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
         val status =
@@ -570,13 +555,22 @@ private class SubtitleLoadErrorHandlingPolicy : DefaultLoadErrorHandlingPolicy()
         val isTransient = status == HTTP_TOO_MANY_REQUESTS || status >= HTTP_SERVER_ERROR
         if (!isTransient) return C.TIME_UNSET
         val exponent = (loadErrorInfo.errorCount - 1).coerceIn(0, MAX_BACKOFF_EXPONENT)
-        return (INITIAL_BACKOFF_MS shl exponent).coerceAtMost(MAX_BACKOFF_MS)
+        val initial = if (isTranslated) TRANSLATED_INITIAL_BACKOFF_MS else INITIAL_BACKOFF_MS
+        val ceiling = if (isTranslated) TRANSLATED_MAX_BACKOFF_MS else MAX_BACKOFF_MS
+        return (initial shl exponent).coerceAtMost(ceiling)
     }
 
     private companion object {
         const val MAX_ATTEMPTS = 6
         const val INITIAL_BACKOFF_MS = 500L
         const val MAX_BACKOFF_MS = 8_000L
+
+        // A tlang fetch is not rate-limited, it is refused by Google's abuse interstitial: no
+        // Retry-After, and it hardens against the IP as attempts continue. Fewer, slower tries
+        // give the block time to lapse while the caller falls back to the source track.
+        const val TRANSLATED_MAX_ATTEMPTS = 3
+        const val TRANSLATED_INITIAL_BACKOFF_MS = 2_000L
+        const val TRANSLATED_MAX_BACKOFF_MS = 20_000L
         const val MAX_BACKOFF_EXPONENT = 4
         const val HTTP_TOO_MANY_REQUESTS = 429
         const val HTTP_SERVER_ERROR = 500

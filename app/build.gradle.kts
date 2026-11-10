@@ -1,3 +1,4 @@
+import com.android.build.api.variant.BuildConfigField
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import java.util.Properties
 
@@ -11,6 +12,43 @@ plugins {
     alias(libs.plugins.room)
 }
 
+val localProperties =
+    Properties().apply {
+        rootDir
+            .resolve("local.properties")
+            .takeIf { it.exists() }
+            ?.inputStream()
+            ?.use { load(it) }
+    }
+
+fun secretValue(
+    property: String,
+    localKey: String,
+    environment: String,
+): String =
+    (project.findProperty(property) as String?)
+        ?: localProperties.getProperty(localKey)
+        ?: System.getenv(environment)
+        ?: ""
+
+// The in-app picker lists the same languages AGP writes into the generated locale config: every
+// values folder that carries a strings.xml, so a new Weblate language shows up in both at once.
+fun translatedLocaleTags(): List<String> =
+    file("src/main/res")
+        .listFiles()
+        .orEmpty()
+        .filter { it.isDirectory && it.resolve("strings.xml").exists() }
+        .mapNotNull { dir ->
+            val qualifier = dir.name.removePrefix("values-")
+            when {
+                qualifier == dir.name -> null
+                qualifier.startsWith("b+") -> qualifier.removePrefix("b+").replace('+', '-')
+                Regex("[a-z]{2,3}(-r[A-Z]{2})?").matches(qualifier) -> qualifier.replace("-r", "-")
+                else -> null
+            }
+        }.map { if (it == "in" || it.startsWith("in-")) "id" + it.removePrefix("in") else it }
+        .sorted()
+
 android {
     namespace = "io.github.aedev.flow"
     compileSdk = 37
@@ -19,8 +57,14 @@ android {
         applicationId = "io.github.aedev.flow"
         minSdk = 26
         targetSdk = 36
-        versionCode = 18
-        versionName = "2.2.1"
+        versionCode = 19
+        versionName = "3.0.0"
+
+        buildConfigField("int", "NIGHTLY_RUN", "0")
+        buildConfigField("String", "APP_LANGUAGE_TAGS", "\"${(listOf("en") + translatedLocaleTags()).joinToString(",")}\"")
+        // Last.fm keys come from the CI secrets; builds without them ask the viewer for their own key.
+        buildConfigField("String", "LASTFM_API_KEY", "\"${secretValue("lastfmApiKey", "lastfm.apiKey", "LASTFM_API_KEY")}\"")
+        buildConfigField("String", "LASTFM_API_SECRET", "\"${secretValue("lastfmApiSecret", "lastfm.apiSecret", "LASTFM_API_SECRET")}\"")
 
         testInstrumentationRunner = "io.github.aedev.flow.HiltTestRunner"
         vectorDrawables {
@@ -68,14 +112,12 @@ android {
         compose = true
     }
 
+    androidResources {
+        generateLocaleConfig = true
+    }
+
     signingConfigs {
         create("release") {
-            val localProperties = Properties()
-            val localPropertiesFile = rootDir.resolve("local.properties")
-            if (localPropertiesFile.exists()) {
-                localPropertiesFile.inputStream().use { localProperties.load(it) }
-            }
-
             storeFile = rootDir.resolve("release.keystore")
             storePassword = (project.findProperty("storePassword") as? String)
                 ?: localProperties.getProperty("storePassword")
@@ -90,32 +132,26 @@ android {
                 ?: System.getenv("KEY_PASSWORD")
                 ?: ""
         }
+        // One long-lived key for every nightly, so each build installs over the last one.
+        create("nightly") {
+            storeFile = rootDir.resolve("nightly.keystore")
+            storePassword = System.getenv("NIGHTLY_STORE_PASSWORD") ?: localProperties.getProperty("nightlyStorePassword") ?: ""
+            keyAlias = System.getenv("NIGHTLY_KEY_ALIAS") ?: localProperties.getProperty("nightlyKeyAlias") ?: ""
+            keyPassword = System.getenv("NIGHTLY_KEY_PASSWORD") ?: localProperties.getProperty("nightlyKeyPassword") ?: ""
+        }
     }
 
     buildTypes {
         debug {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            buildConfigField("String", "UPDATE_CHANNEL", "\"stable\"")
             isDebuggable = true
             isMinifyEnabled = false
             isShrinkResources = false
         }
-        // Nightly: release-level performance + debug signing so it's easy to
-        // sideload. Fixes the laggy-nightly issue reported in #66.
-        create("nightly") {
-            initWith(getByName("release"))
-            applicationIdSuffix = ".nightly"
-            versionNameSuffix = "-nightly"
-            isDebuggable = false
-            isMinifyEnabled = true
-            isShrinkResources = false
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro",
-            )
-            signingConfig = signingConfigs.getByName("debug")
-        }
         release {
+            buildConfigField("String", "UPDATE_CHANNEL", "\"stable\"")
             isDebuggable = false
             isMinifyEnabled = true
             isShrinkResources = true
@@ -137,6 +173,19 @@ android {
                 signingConfig = null // Let Gradle build an unsigned APK for IzzyOnDroid/F-Droid
                 println("WARNING: Release keystore not found. Building UNSIGNED release APK.")
             }
+        }
+        // Nightly: release-level performance under its own app id. It must come after release,
+        // because initWith copies release as it stands at this point.
+        create("nightly") {
+            initWith(getByName("release"))
+            // PR runs carry the nightly key too, so their own id keeps a test build from installing over a
+            // tester's nightly, which the next nightly would then open with an older schema (#1854).
+            applicationIdSuffix = if (providers.gradleProperty("flow.prBuild").isPresent) ".nightly.pr" else ".nightly"
+            versionNameSuffix = "-nightly"
+            matchingFallbacks += "release"
+            buildConfigField("String", "UPDATE_CHANNEL", "\"nightly\"")
+            val nightlyKey = signingConfigs.getByName("nightly")
+            signingConfig = if (nightlyKey.storeFile?.exists() == true) nightlyKey else signingConfigs.getByName("debug")
         }
     }
 
@@ -170,7 +219,52 @@ android {
     testOptions {
         unitTests {
             isReturnDefaultValues = true
+            isIncludeAndroidResources = true
         }
+    }
+}
+
+// JVM tests load Conscrypt's desktop build, which has the same API but native code for the host.
+configurations.matching { it.name.endsWith("UnitTestRuntimeClasspath") }.configureEach {
+    exclude(group = "org.conscrypt", module = "conscrypt-android")
+}
+
+tasks.withType<Test>().configureEach {
+    maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
+    // `-Dflow.fuzz.cases=N` and `-Dflow.fuzz.seed=S` reach the property tests.
+    for (name in listOf("flow.fuzz.cases", "flow.fuzz.seed")) providers.systemProperty(name).orNull?.let { systemProperty(name, it) }
+}
+
+// One profile for every shipped variant: foss, nightly and github run the same startup code, and
+// a per-variant profile left foss and nightly with library profiles only (#1301).
+baselineProfile {
+    mergeIntoMain = true
+}
+
+// CI nightlies are numbered by workflow run: versionCode = run, versionName = <next>-nightly.<run>+<sha>.
+// Local nightly builds keep defaultConfig's version, so they never replace a CI nightly.
+androidComponents {
+    onVariants(selector().withBuildType("nightly")) { variant ->
+        val run = providers.environmentVariable("GITHUB_RUN_NUMBER").map(String::toInt)
+        val sha = providers.environmentVariable("GITHUB_SHA").map { it.take(7) }
+        val base = providers.gradleProperty("flow.nightlyBaseVersion")
+        variant.outputs.forEach { output ->
+            val localCode = output.versionCode.get()
+            val localName = output.versionName.get()
+            output.versionCode.set(run.orElse(localCode))
+            output.versionName.set(
+                base
+                    .zip(run) { name, number -> "$name-nightly.$number" }
+                    .zip(sha) { name, commit -> "$name+$commit" }
+                    .orElse(localName),
+            )
+        }
+        variant.buildConfigFields?.put(
+            "NIGHTLY_RUN",
+            run
+                .map { BuildConfigField("int", it.toString(), null) }
+                .orElse(BuildConfigField("int", "0", null)),
+        )
     }
 }
 
@@ -212,7 +306,14 @@ dependencies {
     // --- Lifecycle & Architecture ---
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.androidx.window)
+    implementation(libs.androidx.window.core)
+    implementation(libs.androidx.material3.adaptive.layout)
+    implementation(libs.androidx.material3.adaptive.navigation)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.process)
+    implementation(libs.androidx.biometric)
+    implementation(libs.androidx.biometric.compose)
 
     // --- Layouts ---
     implementation(libs.androidx.constraintlayout.compose)
@@ -221,6 +322,7 @@ dependencies {
     implementation(libs.coil.compose)
     implementation(libs.compose.reorderable)
     implementation(libs.coil.video)
+    implementation(libs.coil.gif)
     implementation(libs.coil.network.okhttp)
     implementation("androidx.palette:palette-ktx:1.0.0")
 
@@ -258,8 +360,11 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.gson)
 
-    // conscrypt for OkHttp TLS support on older Android versions
+    // conscrypt for OkHttp TLS support on older Android versions, and HPKE for linked devices
     implementation(libs.conscrypt.android)
+    // Linked devices: Ed25519 and X25519 (Conscrypt can't derive a public key from a seed), recovery words
+    implementation(libs.bouncycastle.bcprov)
+    implementation(libs.kotlin.bip39)
 
     // --- Media Playback ---
     implementation(libs.androidx.media3.exoplayer)
@@ -270,6 +375,8 @@ dependencies {
     implementation(libs.androidx.media3.exoplayer.dash)
     implementation(libs.androidx.media3.datasource)
     implementation(libs.androidx.media3.datasource.okhttp)
+    implementation(libs.androidx.media3.muxer)
+    implementation(libs.androidx.media3.inspector)
     implementation(libs.androidx.media)
 
     // --- Database & Storage ---
@@ -291,7 +398,6 @@ dependencies {
     implementation(libs.androidx.paging.compose)
 
     implementation(libs.androidx.work.runtime.ktx)
-    "githubImplementation"(libs.apkupdater)
 
     implementation(libs.brotli)
     implementation(libs.re2j)
@@ -301,6 +407,8 @@ dependencies {
     // library AARs (Compose, RecyclerView, ...) at build time; this applies them at runtime,
     // which matters for sideloaded/F-Droid installs that bypass Play's cloud profiles.
     implementation(libs.androidx.profileinstaller)
+    // Trace sections the startup and Home benchmarks measure (#1301); already on the classpath through Compose.
+    implementation(libs.androidx.tracing)
     baselineProfile(project(":benchmark"))
 
     // Desugaring for older Android versions
@@ -308,13 +416,24 @@ dependencies {
 
     // --- Testing ---
     testImplementation(libs.junit)
+    testImplementation(libs.conscrypt.openjdk.uber)
     testImplementation(libs.kxml2)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.mockk)
     testImplementation(libs.truth)
+    // Han word breaker for tests; the JDK breaker does not split Han runs.
+    testImplementation(libs.icu4j)
     testImplementation(libs.turbine)
+    testImplementation(libs.androidx.glance.appwidget.testing)
     testImplementation(libs.hilt.android.testing)
     kspTest(libs.hilt.android.compiler)
+
+    // Compose UI tests in the JVM (Robolectric) so CI's unit-test task covers them
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core)
+    testImplementation(libs.androidx.test.ext.junit)
+    testImplementation(platform(libs.androidx.compose.bom))
+    testImplementation(libs.androidx.ui.test.junit4)
 
     // Room migration tests (device-sync schema 20→23)
     androidTestImplementation(libs.androidx.room.testing)

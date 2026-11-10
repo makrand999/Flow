@@ -1,7 +1,7 @@
 /*
  * Copyright (C) 2025-2026 Flow | A-EDev
  *
- * This file is part of Flow (https://github.com/A-EDev/Flow).
+ * This file is part of Flow (https://github.com/Flow-Tube/Flow).
  *
  * This recommendation algorithm (FlowNeuroEngine) is the intellectual property
  * of the Flow project. Any use of this code in other projects must
@@ -13,8 +13,10 @@ package io.github.aedev.flow.data.recommendation
 import android.content.Context
 import android.util.Log
 import androidx.datastore.core.DataStore
+import androidx.datastore.core.DataStoreFactory
 import androidx.datastore.core.Serializer
-import androidx.datastore.dataStore
+import io.github.aedev.flow.data.profile.ProfileFiles
+import io.github.aedev.flow.data.profile.StoreScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
@@ -50,6 +52,7 @@ internal class NeuroContentStore(
     @Serializable
     data class ContentIndex(
         val vectors: Map<String, StoredVector> = emptyMap(),
+        val keySpec: Int = 0,
     )
 
     private object ContentSerializer : Serializer<ContentIndex> {
@@ -76,11 +79,12 @@ internal class NeuroContentStore(
         }
     }
 
-    private val Context.contentDataStore: DataStore<ContentIndex>
-        by dataStore(
-            fileName = "flow_neuro_content_v1.json",
+    private val contentDataStore: DataStore<ContentIndex> by lazy {
+        DataStoreFactory.create(
             serializer = ContentSerializer,
+            produceFile = { ProfileFiles.dataStore(appContext, StoreScope.PROFILE_PRIVATE, "flow_neuro_content_v1.json") },
         )
+    }
 
     @Volatile
     private var vectors: Map<String, StoredVector> = emptyMap()
@@ -91,10 +95,14 @@ internal class NeuroContentStore(
     suspend fun load() {
         withContext(Dispatchers.IO) {
             try {
-                vectors =
-                    appContext.contentDataStore.data
-                        .first()
-                        .vectors
+                val index = contentDataStore.data.first()
+                // Vectors keyed by an older key spec hold chance pairs; videos refill it as they are opened (#907).
+                if (index.keySpec < NeuroKeySpec.VERSION) {
+                    vectors = emptyMap()
+                    dirty = index.vectors.isNotEmpty()
+                } else {
+                    vectors = index.vectors
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to load content index", e)
             }
@@ -139,7 +147,7 @@ internal class NeuroContentStore(
         withContext(Dispatchers.IO) {
             try {
                 val snapshot = vectors
-                appContext.contentDataStore.updateData { ContentIndex(snapshot) }
+                contentDataStore.updateData { ContentIndex(snapshot, NeuroKeySpec.VERSION) }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to persist content index", e)
             }
@@ -151,7 +159,7 @@ internal class NeuroContentStore(
         dirty = false
         withContext(Dispatchers.IO) {
             try {
-                appContext.contentDataStore.updateData { ContentIndex() }
+                contentDataStore.updateData { ContentIndex() }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to clear content index", e)
             }

@@ -1,14 +1,18 @@
 package io.github.aedev.flow.ui.screens.player.state
 
-import android.content.Context
-import android.media.AudioManager
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.runtime.*
-import io.github.aedev.flow.ui.components.CommentSortFilter
-import io.github.aedev.flow.ui.components.SubtitleStyle
+import io.github.aedev.flow.ui.components.shared.CommentSortFilter
+import io.github.aedev.flow.ui.components.shared.CommentThreadState
+import io.github.aedev.flow.ui.components.videoplayer.settings.PlayerSettingsPage
+import io.github.aedev.flow.ui.components.videoplayer.subtitle.SubtitleStyle
 
+// Every property is snapshot state, so composables taking this instance can skip on identity.
+@Stable
 class PlayerScreenState {
     // UI Visibility States
     var showControls by mutableStateOf(true)
+    var showStatsForNerds by mutableStateOf(false)
     var isTouchLocked by mutableStateOf(false)
     var lockOverlayRevealSignal by mutableIntStateOf(0)
     var isFullscreen by mutableStateOf(false)
@@ -26,48 +30,46 @@ class PlayerScreenState {
     var bufferedPosition by mutableLongStateOf(0L)
     var duration by mutableLongStateOf(0L)
 
-    // Dialog States
-    var showQualitySelector by mutableStateOf(false)
-    var showAudioTrackSelector by mutableStateOf(false)
-    var showSubtitleSelector by mutableStateOf(false)
-    var showSettingsMenu by mutableStateOf(false)
-    var showDownloadDialog by mutableStateOf(false)
-    var showPlaybackSpeedSelector by mutableStateOf(false)
-    var showSubtitleStyleCustomizer by mutableStateOf(false)
-    var showSleepTimerSheet by mutableStateOf(false)
-    var showDlnaDialog by mutableStateOf(false)
+    // Sheets, panels and dialogs (exactly one at a time)
+    internal var activeSheet by mutableStateOf<PlayerSheet>(PlayerSheet.None)
 
-    // Bottom Sheet States
-    var showQuickActions by mutableStateOf(false)
-    var showCommentsSheet by mutableStateOf(false)
-    var showDescriptionSheet by mutableStateOf(false)
-    var showChaptersSheet by mutableStateOf(false)
-    var showPlaylistQueueSheet by mutableStateOf(false)
-    var showLiveChatSheet by mutableStateOf(false)
-    var showLiveChatPanel by mutableStateOf(true)
-    var showLiveChatFullscreen by mutableStateOf(false)
-    var showCommentsFullscreen by mutableStateOf(false)
+    // The tablet side column's own show/hide toggle, not a sheet: it survives a sheet dismissal.
+    // Closed until tapped, because an open column is a running poll (#1042).
+    var showLiveChatPanel by mutableStateOf(false)
 
     // Comment Sorting
     var commentSortFilter by mutableStateOf(CommentSortFilter.TOP)
 
+    // Outlives the comments sheet and panel, which leave composition on every close, collapse and rotation.
+    var commentsListState by mutableStateOf(LazyListState())
+        private set
+    val commentThreads = CommentThreadState()
+
+    // Written by the host from the player sheet's settled anchor; the comments sheet outlives a collapse.
+    var isPlayerExpanded by mutableStateOf(true)
+
     // Gesture States
     var brightnessLevel by mutableFloatStateOf(0.5f)
     var volumeLevel by mutableFloatStateOf(0.5f)
-    var maxVolumeLevel by mutableFloatStateOf(2.0f) // Allow up to 200%
     var showBrightnessOverlay by mutableStateOf(false)
     var showVolumeOverlay by mutableStateOf(false)
+    var showSpeedSwipeOverlay by mutableStateOf(false)
+    var speedSwipeLevel by mutableFloatStateOf(1.0f)
 
     // Seek Animation States
     var showSeekForwardAnimation by mutableStateOf(false)
     var seekAccumulation by mutableIntStateOf(10)
-    var lastSeekTime by mutableLongStateOf(0L)
     var showSeekBackAnimation by mutableStateOf(false)
 
+    /** A tap just lifted and the double-tap timeout is still running. */
+    var isTapWindowOpen by mutableStateOf(false)
+
     // Subtitle States
-    var subtitlesEnabled by mutableStateOf(false)
-    var selectedSubtitleUrl by mutableStateOf<String?>(null)
     var subtitleStyle by mutableStateOf(SubtitleStyle())
+
+    // The caption track the transcript is read from. Separate from the subtitle choice: reading
+    // a transcript in another language should not put that language on top of the video.
+    var selectedTranscriptUrl by mutableStateOf<String?>(null)
 
     // Video Display
     var resizeMode by mutableIntStateOf(0) // 0=Fit, 1=Fill, 2=Zoom
@@ -79,7 +81,9 @@ class PlayerScreenState {
     var showZoomIndicator by mutableStateOf(false)
     var zoomIndicatorSequence by mutableIntStateOf(0)
     var exitDragOffsetY by mutableFloatStateOf(0f)
-    var exitDragProgress by mutableFloatStateOf(0f)
+
+    // How far a swipe up has pulled the more videos row in before it commits to opening.
+    var moreVideosDragY by mutableFloatStateOf(0f)
 
     // Speed Control
     var isSpeedBoostActive by mutableStateOf(false)
@@ -101,57 +105,60 @@ class PlayerScreenState {
         lockOverlayRevealSignal = 0
         currentPosition = 0L
         duration = 0L
-        subtitlesEnabled = false
-        selectedSubtitleUrl = null
+        commentSortFilter = CommentSortFilter.TOP
+        resetCommentsPlace()
+        selectedTranscriptUrl = null
         showBrightnessOverlay = false
         showVolumeOverlay = false
+        showSpeedSwipeOverlay = false
         showSeekBackAnimation = false
         showSeekForwardAnimation = false
         hasShownShortsPrompt = false
         showShortsPrompt = false
-        showPlaylistQueueSheet = false
-        // Reset dialogs
-        showDownloadDialog = false
-        showQualitySelector = false
-        showAudioTrackSelector = false
-        showSubtitleSelector = false
-        showSettingsMenu = false
-        showPlaybackSpeedSelector = false
-        showSubtitleStyleCustomizer = false
-        showSleepTimerSheet = false
-        showDlnaDialog = false
-        // Reset bottom sheets
-        showQuickActions = false
-        showCommentsSheet = false
-        showDescriptionSheet = false
-        showChaptersSheet = false
-        showLiveChatSheet = false
-        showLiveChatPanel = true
-        showLiveChatFullscreen = false
-        showCommentsFullscreen = false
+        activeSheet = PlayerSheet.None
+        showLiveChatPanel = false
         zoomScale = 1f
         zoomOffsetX = 0f
         zoomOffsetY = 0f
         showZoomIndicator = false
         zoomIndicatorSequence = 0
         exitDragOffsetY = 0f
-        exitDragProgress = 0f
+        moreVideosDragY = 0f
     }
 
+    fun changeCommentSort(filter: CommentSortFilter) {
+        if (filter == commentSortFilter) return
+        commentSortFilter = filter
+        resetCommentsPlace()
+    }
+
+    private fun resetCommentsPlace() {
+        commentsListState = LazyListState()
+        commentThreads.clear()
+    }
+
+    internal fun open(sheet: PlayerSheet) {
+        activeSheet = sheet
+    }
+
+    internal fun closeSheet() {
+        activeSheet = PlayerSheet.None
+    }
+
+    internal val isSettingsOpen: Boolean
+        get() = activeSheet is PlayerSheet.Settings
+
+    internal val settingsPage: PlayerSettingsPage
+        get() = (activeSheet as? PlayerSheet.Settings)?.page ?: PlayerSettingsPage.Main
+
+    /**
+     * Re-anchoring the player — collapsing it, entering or leaving fullscreen — drops whatever it
+     * had raised over the stage. Now that [activeSheet] holds a single surface this closes *every*
+     * sheet: the sleep timer, download, cast and quick-action dialogs that the previous
+     * eighteen-boolean state deliberately left standing cannot survive an exclusive state.
+     */
     fun dismissMediaSheets() {
-        showCommentsSheet = false
-        showDescriptionSheet = false
-        showChaptersSheet = false
-        showLiveChatSheet = false
-        showLiveChatFullscreen = false
-        showCommentsFullscreen = false
-        showPlaylistQueueSheet = false
-        showSettingsMenu = false
-        showQualitySelector = false
-        showAudioTrackSelector = false
-        showSubtitleSelector = false
-        showPlaybackSpeedSelector = false
-        showSubtitleStyleCustomizer = false
+        closeSheet()
     }
 
     fun cycleResizeMode() {
@@ -163,16 +170,6 @@ class PlayerScreenState {
         isFullscreen = !isFullscreen
     }
 
-    fun enableSubtitles(url: String) {
-        selectedSubtitleUrl = url
-        subtitlesEnabled = true
-    }
-
-    fun disableSubtitles() {
-        subtitlesEnabled = false
-        selectedSubtitleUrl = null
-    }
-
     fun onInteraction() {
         lastInteractionTimestamp = System.currentTimeMillis()
     }
@@ -180,22 +177,28 @@ class PlayerScreenState {
     fun revealLockOverlay() {
         lockOverlayRevealSignal++
     }
+
+    fun playbackFraction(): Float = if (duration > 0) (currentPosition.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else 0f
 }
 
 @Composable
 fun rememberPlayerScreenState(): PlayerScreenState = remember { PlayerScreenState() }
 
-data class AudioSystemInfo(
-    val audioManager: AudioManager,
-    val maxVolume: Int,
-)
+internal fun transcriptTrackUrl(
+    playerState: io.github.aedev.flow.player.EnhancedPlayerState,
+    screenState: PlayerScreenState,
+    prefs: VideoPlayerPreferencesState,
+    appLanguage: String?,
+): String? =
+    TranscriptTrackChoice
+        .pick(
+            tracks = playerState.availableSubtitles,
+            pickedUrl = screenState.selectedTranscriptUrl,
+            showingUrl = playerState.selectedSubtitleUrl,
+            rememberedLanguage = prefs.transcriptLanguage,
+            subtitleLanguage = prefs.preferredSubtitleLanguage,
+            appLanguage = appLanguage,
+        )?.url
 
-@Composable
-fun rememberAudioSystemInfo(context: Context): AudioSystemInfo =
-    remember {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        AudioSystemInfo(
-            audioManager = audioManager,
-            maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC),
-        )
-    }
+internal fun hasTranscriptTrack(playerState: io.github.aedev.flow.player.EnhancedPlayerState): Boolean =
+    playerState.availableSubtitles.any(TranscriptTrackChoice::isReadable)

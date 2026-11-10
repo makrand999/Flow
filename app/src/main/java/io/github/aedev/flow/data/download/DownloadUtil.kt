@@ -1,36 +1,37 @@
 package io.github.aedev.flow.data.download
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
 import androidx.core.net.toUri
 import androidx.media3.common.C
-import androidx.media3.database.DatabaseProvider
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.ResolvingDataSource
-import androidx.media3.datasource.cache.CacheDataSink
+import androidx.media3.datasource.cache.Cache
 import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.ContentMetadata
+import androidx.media3.datasource.cache.ContentMetadataMutations
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.datasource.okhttp.OkHttpDataSource
-import androidx.media3.exoplayer.offline.Download
-import androidx.media3.exoplayer.offline.DownloadManager
-import androidx.media3.exoplayer.offline.DownloadNotificationHelper
 import dagger.hilt.android.qualifiers.ApplicationContext
+import io.github.aedev.flow.data.local.dao.DownloadDao
+import io.github.aedev.flow.data.video.storage.DownloadFiles
 import io.github.aedev.flow.di.DownloadCache
-import io.github.aedev.flow.di.PlayerCache
+import io.github.aedev.flow.di.MusicCache
 import io.github.aedev.flow.network.AppProxyManager
-import io.github.aedev.flow.service.ExoDownloadService
+import io.github.aedev.flow.player.datasource.GoogleVideoRequestPolicy
+import io.github.aedev.flow.player.datasource.RefusedStreamRetryDataSource
+import io.github.aedev.flow.player.error.StreamDenialClassifier
+import io.github.aedev.flow.player.error.StreamDenialKind
+import io.github.aedev.flow.player.stream.ClientGateTracker
 import io.github.aedev.flow.utils.MusicPlayerUtils
-import kotlinx.coroutines.CoroutineScope
+import io.github.aedev.flow.utils.potoken.WebPoTokenSession
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
+import java.io.File
 import java.io.IOException
-import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -40,122 +41,38 @@ class DownloadUtil
     @Inject
     constructor(
         @ApplicationContext private val context: Context,
-        private val databaseProvider: DatabaseProvider,
         @DownloadCache private val downloadCache: SimpleCache,
-        @PlayerCache private val playerCache: SimpleCache,
+        @MusicCache private val musicCache: SimpleCache,
+        private val downloadDao: DownloadDao,
     ) {
         companion object {
             private const val TAG = "DownloadUtil"
-            private const val CHUNK_LENGTH = 512 * 1024L // 512KB for cache check
+            private const val CHUNK_LENGTH = 512 * 1024L // per stream request
             private val URL_RANGE_PARAM_REGEX = Regex("""([?&])range=\d+-\d*(&?)""")
+            private const val SONG_FILE_METADATA = ContentMetadata.KEY_CUSTOM_PREFIX + "flow_song_file"
         }
 
-        private val songUrlCache = java.util.concurrent.ConcurrentHashMap<String, Triple<String, String, Long>>()
+        private class ResolvedSong(
+            val url: String,
+            val userAgent: String,
+            val expiresAtMs: Long,
+            val fileId: String,
+        )
 
-        // Download-specific cache storing range-appended URLs for full-speed downloads
-        private val downloadUrlCache = java.util.concurrent.ConcurrentHashMap<String, Triple<String, String, Long>>()
-        private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val downloads = MutableStateFlow<Map<String, Download>>(emptyMap())
+        private val songUrlCache = java.util.concurrent.ConcurrentHashMap<String, ResolvedSong>()
 
         private val okHttpClient: OkHttpClient by lazy {
-            AppProxyManager
-                .applyTo(OkHttpClient.Builder())
-                .connectTimeout(30, TimeUnit.SECONDS)
-                .readTimeout(60, TimeUnit.SECONDS)
-                .build()
-        }
-
-        /**
-         * DataSource factory for DOWNLOADS - writes to downloadCache.
-         * Used by DownloadManager for downloading tracks for offline playback.
-         */
-        val dataSourceFactory: ResolvingDataSource.Factory
-            get() =
-                ResolvingDataSource.Factory(
-                    CacheDataSource
-                        .Factory()
-                        .setCache(downloadCache)
-                        .setCacheWriteDataSinkFactory(CacheDataSink.Factory().setCache(downloadCache))
-                        .setUpstreamDataSourceFactory(OkHttpDataSource.Factory(okHttpClient))
-                        .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR),
-                ) { dataSpec ->
-                    resolveDataSpec(dataSpec, "Download")
-                }
-
-        /**
-         * Resolve DataSpec by looking up cached URL or fetching from network.
-         */
-        private fun resolveDataSpec(
-            dataSpec: DataSpec,
-            source: String,
-        ): DataSpec {
-            if (dataSpec.uri.scheme in setOf("file", "content", "android.resource")) {
-                return dataSpec
-            }
-
-            val mediaId = dataSpec.key ?: error("No media id (key) in dataSpec")
-
-            Log.d(TAG, "[$source] Resolving for $mediaId")
-
-            try {
-                val cachedSpans = downloadCache.getCachedSpans(mediaId)
-                if (cachedSpans.isNotEmpty()) {
-                    val totalCached = cachedSpans.sumOf { it.length }
-                    Log.d(TAG, "[$source] $mediaId found in downloadCache (${totalCached / 1024}KB)")
-                    return dataSpec
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "[$source] Error checking downloadCache for $mediaId: ${e.message}")
-            }
-            // Check download-specific cache (stores range-appended URLs for full-speed downloads)
-            downloadUrlCache[mediaId]?.takeIf { it.third > System.currentTimeMillis() }?.let { (url, ua, _) ->
-                Log.d(TAG, "[$source] Using cached download URL for $mediaId")
-                return dataSpec
-                    .buildUpon()
-                    .setUri(url.toUri())
-                    .setHttpRequestHeaders(mapOf("User-Agent" to ua))
-                    .build()
-            }
-
-            Log.d(TAG, "[$source] Resolving URL from network for $mediaId")
-            val playbackData =
-                runBlocking(Dispatchers.IO) {
-                    MusicPlayerUtils.playerResponseForPlayback(mediaId)
-                }.getOrElse { e ->
-                    Log.e(TAG, "[$source] Failed to resolve $mediaId: ${e.message}")
-                    throw IOException("Could not resolve URL for $mediaId: ${e.message}", e)
-                }
-
-            val streamUrl = playbackData.streamUrl
-            val userAgent = playbackData.usedClient.userAgent
-            val expiration = System.currentTimeMillis() + (playbackData.streamExpiresInSeconds - 60) * 1000L
-
-            songUrlCache[mediaId] = Triple(streamUrl, userAgent, expiration)
-
-            // Append &range=0-{contentLength} so YouTube CDN serves the full file at full speed
-            // Without this, WEB_REMIX streams are throttled to ~real-time playback speed
-            val contentLength = playbackData.format.contentLength
-            val downloadUrl =
-                if (contentLength != null) {
-                    val sep = if ("?" in streamUrl) "&" else "?"
-                    "${streamUrl}${sep}range=0-$contentLength"
-                } else {
-                    streamUrl
-                }
-
-            downloadUrlCache[mediaId] = Triple(downloadUrl, userAgent, expiration)
-            Log.d(TAG, "[$source] Resolved $mediaId via ${playbackData.usedClient.clientName}, contentLength=$contentLength")
-
-            return dataSpec
-                .buildUpon()
-                .setUri(downloadUrl.toUri())
-                .setHttpRequestHeaders(mapOf("User-Agent" to userAgent))
-                .build()
+            AppProxyManager.buildLive(
+                OkHttpClient
+                    .Builder()
+                    .connectTimeout(30, TimeUnit.SECONDS)
+                    .readTimeout(60, TimeUnit.SECONDS),
+            )
         }
 
         /**
          * DataSource factory for PLAYBACK - reads from both caches.
-         * Chain: downloadCache (read-only) -> playerCache (read-write) -> network
+         * Chain: downloadCache (read-only) -> musicCache (read-write) -> network
          */
         fun getPlayerDataSourceFactory(): androidx.media3.datasource.DataSource.Factory {
             val downloadCacheFactory =
@@ -165,67 +82,149 @@ class DownloadUtil
                     .setCacheWriteDataSinkFactory(null)
                     .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
-            val playerCacheFactory =
+            // A cache read that outlives its span (evicted meanwhile) still holds the music:// uri.
+            val networkFactory =
+                ResolvingDataSource.Factory(DefaultDataSource.Factory(context, OkHttpDataSource.Factory(okHttpClient))) { dataSpec ->
+                    if (dataSpec.uri.scheme == LocalCopyDataSource.MUSIC_SCHEME) resolveStream(dataSpec) else dataSpec
+                }
+
+            val musicCacheFactory =
                 CacheDataSource
                     .Factory()
-                    .setCache(playerCache)
-                    .setUpstreamDataSourceFactory(
-                        DefaultDataSource.Factory(context, OkHttpDataSource.Factory(okHttpClient)),
-                    ).setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+                    .setCache(musicCache)
+                    .setUpstreamDataSourceFactory(networkFactory)
+                    .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
             val cachedDataSourceFactory =
                 downloadCacheFactory
-                    .setUpstreamDataSourceFactory(playerCacheFactory)
+                    .setUpstreamDataSourceFactory(musicCacheFactory)
 
-            return ResolvingDataSource.Factory(cachedDataSourceFactory) { dataSpec ->
-                if (dataSpec.uri.scheme in setOf("file", "content", "android.resource")) {
-                    return@Factory dataSpec
-                }
-
-                val mediaId = dataSpec.key ?: error("No media id (key) in dataSpec")
-
-                try {
-                    if (downloadCache.isCached(mediaId, dataSpec.position, maxOf(dataSpec.length, 1))) {
-                        Log.d(TAG, "[Player] Serving from downloadCache: $mediaId")
+            val resolvingFactory =
+                ResolvingDataSource.Factory(cachedDataSourceFactory) { dataSpec ->
+                    if (dataSpec.uri.scheme in setOf("file", "content", "android.resource")) {
                         return@Factory dataSpec
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "[Player] downloadCache check error for $mediaId", e)
+
+                    val mediaId = dataSpec.key ?: error("No media id (key) in dataSpec")
+
+                    // A cache hit is bounded to the bytes actually held: an open-ended read would make
+                    // the cache fetch the rest itself, and record the end of that fetch as the song's
+                    // length. ChunkStitchingDataSource opens the next piece where this one stops.
                     try {
-                        downloadCache.removeResource(mediaId)
-                    } catch (_: Exception) {
+                        val span = downloadCache.cachedSpan(mediaId, dataSpec)
+                        if (span > 0) {
+                            Log.d(TAG, "[Player] Serving from downloadCache: $mediaId")
+                            return@Factory dataSpec.subrange(0, span)
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "[Player] downloadCache check error for $mediaId", e)
+                        try {
+                            downloadCache.removeResource(mediaId)
+                        } catch (_: Exception) {
+                        }
                     }
-                }
 
-                try {
-                    if (playerCache.isCached(mediaId, dataSpec.position, CHUNK_LENGTH)) {
-                        Log.d(TAG, "[Player] Serving from playerCache: $mediaId")
-                        return@Factory dataSpec
+                    try {
+                        val span = musicCache.cachedSpan(mediaId, dataSpec)
+                        if (span > 0) {
+                            Log.d(TAG, "[Player] Serving from musicCache: $mediaId")
+                            return@Factory dataSpec.subrange(0, span)
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "[Player] musicCache check error for $mediaId", e)
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "[Player] playerCache check error for $mediaId", e)
+
+                    resolveStream(dataSpec)
                 }
-
-                songUrlCache[mediaId]?.takeIf { it.third > System.currentTimeMillis() }?.let { (url, ua, _) ->
-                    Log.d(TAG, "[Player] Using cached URL for $mediaId")
-                    return@Factory buildPlaybackDataSpec(dataSpec, url, ua)
+            val localFirst = LocalCopyDataSource.Factory(DefaultDataSource.Factory(context), resolvingFactory, ::downloadedSongUri)
+            val refusalRetrying =
+                RefusedStreamRetryDataSource.Factory(localFirst) { dataSpec, url ->
+                    val mediaId = dataSpec.key
+                    if (mediaId != null) onStreamRefused(mediaId, url)
+                    mediaId != null
                 }
+            return ChunkStitchingDataSource.Factory(refusalRetrying)
+        }
 
-                val playbackData =
-                    runBlocking(Dispatchers.IO) {
-                        MusicPlayerUtils.playerResponseForPlayback(mediaId)
-                    }.getOrThrow()
+        private fun SimpleCache.cachedSpan(
+            key: String,
+            dataSpec: DataSpec,
+        ): Long = getCachedLength(key, dataSpec.position, dataSpec.length).coerceAtLeast(0L)
 
-                val streamUrl = playbackData.streamUrl
-                val userAgent = playbackData.usedClient.userAgent
-                val expiration = System.currentTimeMillis() + (playbackData.streamExpiresInSeconds - 60) * 1000L
+        private fun resolveStream(dataSpec: DataSpec): DataSpec {
+            val mediaId = dataSpec.key ?: error("No media id (key) in dataSpec")
+            songUrlCache[mediaId]?.takeIf(::isReusable)?.let { song ->
+                Log.d(TAG, "[Player] Using cached URL for $mediaId")
+                recordSongFile(mediaId, song.fileId)
+                return buildPlaybackDataSpec(dataSpec, song.url, song.userAgent)
+            }
 
-                songUrlCache[mediaId] = Triple(streamUrl, userAgent, expiration)
-                Log.d(TAG, "[Player] Resolved $mediaId via ${playbackData.usedClient.clientName}")
+            val playbackData =
+                runBlocking(Dispatchers.IO) {
+                    MusicPlayerUtils.playerResponseForPlayback(mediaId)
+                }.getOrThrow()
 
-                buildPlaybackDataSpec(dataSpec, streamUrl, userAgent)
+            val cachedFileId = cachedSongFile(mediaId)
+            val format =
+                streamToContinue(cachedFileId, playbackData.format, playbackData.audioFormats)
+                    ?: throw SongFileGoneException(mediaId)
+            if (format !== playbackData.format) Log.d(TAG, "[Player] $mediaId keeps its cached file $cachedFileId")
+
+            val streamUrl = format.url ?: throw IOException("Audio format ${format.itag} of $mediaId has no url")
+            val userAgent = playbackData.usedClient.userAgent
+            val expiration = System.currentTimeMillis() + (playbackData.streamExpiresInSeconds - 60) * 1000L
+
+            songUrlCache[mediaId] = ResolvedSong(streamUrl, userAgent, expiration, format.fileId())
+            recordSongFile(mediaId, format.fileId())
+            Log.d(TAG, "[Player] Resolved $mediaId via ${playbackData.usedClient.clientName}")
+
+            return buildPlaybackDataSpec(dataSpec, streamUrl, userAgent)
+        }
+
+        /** The file the song's cached bytes came from. A song cached before this was kept has none on record. */
+        private fun cachedSongFile(mediaId: String): String? =
+            musicCache
+                .takeIf { it.getCachedSpans(mediaId).isNotEmpty() }
+                ?.getContentMetadata(mediaId)
+                ?.get(SONG_FILE_METADATA, null as String?)
+
+        private fun recordSongFile(
+            mediaId: String,
+            fileId: String,
+        ) {
+            if (musicCache.getContentMetadata(mediaId).get(SONG_FILE_METADATA, null as String?) == fileId) return
+            try {
+                musicCache.applyContentMetadataMutations(mediaId, ContentMetadataMutations().set(SONG_FILE_METADATA, fileId))
+            } catch (e: Cache.CacheException) {
+                Log.w(TAG, "[Player] Could not record the file of $mediaId", e)
             }
         }
+
+        private fun onStreamRefused(
+            mediaId: String,
+            url: String,
+        ) {
+            val kind = ClientGateTracker.reportDenied(url)
+            if (kind == StreamDenialKind.TOKEN_REJECTED) WebPoTokenSession.reportTokenRejected()
+            songUrlCache.remove(mediaId)
+            MusicPlayerUtils.forceRefreshForVideo(mediaId)
+            Log.w(TAG, "[Player] $mediaId refused (${StreamDenialClassifier.clientOf(url)}, $kind), resolving a fresh url")
+        }
+
+        /** The saved file of a finished song download, while it is still there. */
+        private fun downloadedSongUri(videoId: String): Uri? {
+            val path =
+                runCatching { downloadDao.completedAudioPathBlocking(videoId) }
+                    .onFailure { Log.w(TAG, "[Player] download lookup failed for $videoId", it) }
+                    .getOrNull()
+                    ?.takeIf { DownloadFiles.exists(context, it) } ?: return null
+            Log.d(TAG, "[Player] Playing the download of $videoId")
+            return if (DownloadFiles.isDocument(path)) path.toUri() else Uri.fromFile(File(path))
+        }
+
+        // A url resolved before its client was demoted would stall the same way ~30 s in.
+        private fun isReusable(song: ResolvedSong): Boolean =
+            song.expiresAtMs > System.currentTimeMillis() && !ClientGateTracker.isGated(StreamDenialClassifier.clientOf(song.url))
 
         private fun buildPlaybackDataSpec(
             dataSpec: DataSpec,
@@ -239,11 +238,13 @@ class DownloadUtil
                     else -> CHUNK_LENGTH
                 }
 
+            val client = StreamDenialClassifier.clientOf(streamUrl)
             return dataSpec
                 .buildUpon()
                 .setUri(removeRangeParameter(streamUrl).toUri())
-                .setHttpRequestHeaders(mapOf("User-Agent" to userAgent))
-                .setLength(requestLength)
+                .setHttpRequestHeaders(
+                    GoogleVideoRequestPolicy.headers(client) + ("User-Agent" to GoogleVideoRequestPolicy.userAgent(client, userAgent)),
+                ).setLength(requestLength)
                 .build()
         }
 
@@ -268,7 +269,6 @@ class DownloadUtil
          */
         fun invalidateUrlCache(mediaId: String) {
             songUrlCache.remove(mediaId)
-            downloadUrlCache.remove(mediaId)
             Log.d(TAG, "Invalidated URL cache for $mediaId")
         }
 
@@ -277,13 +277,12 @@ class DownloadUtil
          */
         fun clearUrlCache() {
             songUrlCache.clear()
-            downloadUrlCache.clear()
             Log.d(TAG, "Cleared all URL cache entries")
         }
 
         /**
          * Aggressive cache clear for error recovery.
-         * Clears URL cache, player cache, and triggers force refresh.
+         * Clears URL cache, music cache, and triggers force refresh.
          */
         fun performAggressiveCacheClear(mediaId: String) {
             Log.d(TAG, "Performing aggressive cache clear for $mediaId")
@@ -291,88 +290,11 @@ class DownloadUtil
             songUrlCache.remove(mediaId)
 
             try {
-                playerCache.removeResource(mediaId)
+                musicCache.removeResource(mediaId)
             } catch (e: Exception) {
-                Log.w(TAG, "Error clearing playerCache for $mediaId: ${e.message}")
+                Log.w(TAG, "Error clearing musicCache for $mediaId: ${e.message}")
             }
 
             MusicPlayerUtils.forceRefreshForVideo(mediaId)
         }
-
-        /**
-         * Check if a track is fully downloaded and available offline.
-         */
-        fun isFullyDownloaded(mediaId: String): Boolean {
-            val download = downloads.value[mediaId] ?: return false
-            return download.state == Download.STATE_COMPLETED
-        }
-
-        /**
-         * Check if a track's audio is in the downloadCache and available for offline playback.
-         * This checks the actual cache content, not just the download state.
-         */
-        fun isCachedForOffline(mediaId: String): Boolean =
-            try {
-                val spans = downloadCache.getCachedSpans(mediaId)
-                if (spans.isEmpty()) {
-                    false
-                } else {
-                    val totalCached = spans.sumOf { it.length }
-                    Log.d(TAG, "[CacheCheck] $mediaId has ${totalCached / 1024}KB in cache")
-                    totalCached >= 100 * 1024
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "[CacheCheck] Error checking cache for $mediaId: ${e.message}")
-                false
-            }
-
-        val downloadNotificationHelper = DownloadNotificationHelper(context, ExoDownloadService.CHANNEL_ID)
-
-        val downloadManager: DownloadManager =
-            DownloadManager(
-                context,
-                databaseProvider,
-                downloadCache,
-                dataSourceFactory,
-                Executor(Runnable::run),
-            ).apply {
-                maxParallelDownloads = 3
-                addListener(
-                    object : DownloadManager.Listener {
-                        override fun onDownloadChanged(
-                            downloadManager: DownloadManager,
-                            download: Download,
-                            finalException: Exception?,
-                        ) {
-                            downloads.update { it.toMutableMap().apply { set(download.request.id, download) } }
-                        }
-
-                        override fun onDownloadRemoved(
-                            downloadManager: DownloadManager,
-                            download: Download,
-                        ) {
-                            downloads.update { it - download.request.id }
-                        }
-                    },
-                )
-            }
-
-        init {
-            scope.launch {
-                val result = mutableMapOf<String, Download>()
-                try {
-                    downloadManager.downloadIndex.getDownloads().use { cursor ->
-                        while (cursor.moveToNext()) {
-                            val download = cursor.download
-                            result[download.request.id] = download
-                        }
-                    }
-                    downloads.value = result
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to load the download index", e)
-                }
-            }
-        }
-
-        fun getDownloadManagerInstance() = downloadManager
     }

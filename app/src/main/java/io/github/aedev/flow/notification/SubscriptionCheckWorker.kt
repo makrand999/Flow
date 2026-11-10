@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
+import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
@@ -19,6 +20,7 @@ import dagger.hilt.components.SingletonComponent
 import io.github.aedev.flow.data.local.ChannelSubscription
 import io.github.aedev.flow.data.local.PlayerPreferences
 import io.github.aedev.flow.data.local.SubscriptionRepository
+import io.github.aedev.flow.data.profile.ProfileWork
 import io.github.aedev.flow.data.shorts.ChannelReelIndex
 import io.github.aedev.flow.data.subscriptions.ChannelRssClient
 import io.github.aedev.flow.data.subscriptions.ChannelRssParser
@@ -71,22 +73,20 @@ class SubscriptionCheckWorker(
         private const val CHANNEL_CHUNK_SIZE = 10
 
         /**
-         * Schedule periodic subscription checks
-         * @param context Application context
-         * @param intervalMinutes How often to check (default: 360 minutes / 6 hours)
+         * Schedules the periodic check; [BackgroundCheckScheduler] decides whether it should run at all. A check
+         * another profile left behind is replaced, so it runs with this profile's interval.
          */
         suspend fun schedulePeriodicCheck(
             context: Context,
-            intervalMinutes: Long = 360,
-            reschedule: Boolean = false,
+            intervalMinutes: Long,
+            reschedule: Boolean,
         ) {
-            val notificationsEnabled = PlayerPreferences(context).notificationsEnabled.first()
-            if (!notificationsEnabled) {
-                cancelScheduledChecks(context)
-                Log.d(TAG, "Skipping subscription check scheduling because notifications are disabled")
-                return
-            }
-
+            val leftByOther =
+                WorkManager
+                    .getInstance(context)
+                    .getWorkInfosForUniqueWorkFlow(WORK_NAME)
+                    .first()
+                    .any { !it.state.isFinished && ProfileWork.queuedByOther(context, it.tags) }
             val constraints =
                 Constraints
                     .Builder()
@@ -102,13 +102,15 @@ class SubscriptionCheckWorker(
                         BackoffPolicy.EXPONENTIAL,
                         WorkRequest.MIN_BACKOFF_MILLIS,
                         TimeUnit.MILLISECONDS,
-                    ).build()
+                    ).setInputData(ProfileWork.data(context))
+                    .addTag(ProfileWork.tag(context))
+                    .build()
 
             WorkManager.getInstance(context).apply {
                 cancelUniqueWork(LEGACY_WORK_NAME)
                 enqueueUniquePeriodicWork(
                     WORK_NAME,
-                    periodicWorkPolicy(reschedule),
+                    if (leftByOther) ExistingPeriodicWorkPolicy.REPLACE else periodicWorkPolicy(reschedule),
                     workRequest,
                 )
             }
@@ -138,7 +140,9 @@ class SubscriptionCheckWorker(
                             .Builder()
                             .setRequiredNetworkType(NetworkType.CONNECTED)
                             .build(),
-                    ).build()
+                    ).setInputData(ProfileWork.data(context))
+                    .addTag(ProfileWork.tag(context))
+                    .build()
 
             WorkManager.getInstance(context).enqueueUniqueWork(
                 IMMEDIATE_WORK_NAME,
@@ -155,10 +159,16 @@ class SubscriptionCheckWorker(
 
     override suspend fun doWork(): Result =
         withContext(Dispatchers.IO) {
+            if (!ProfileWork.belongsHere(this@SubscriptionCheckWorker)) return@withContext Result.success()
             Log.d(TAG, "Starting subscription check via RSS...")
 
-            if (!dependencies.playerPreferences().notificationsEnabled.first()) {
-                Log.d(TAG, "Notifications disabled, skipping subscription check")
+            val preferences = dependencies.playerPreferences()
+            if (!BackgroundCheckScheduler.subscriptionCheckWanted(
+                    preferences.notificationsEnabled.first(),
+                    preferences.notifNewVideosEnabled.first(),
+                )
+            ) {
+                Log.d(TAG, "New video notifications are off, skipping subscription check")
                 return@withContext Result.success()
             }
 
@@ -177,7 +187,8 @@ class SubscriptionCheckWorker(
 
                 Log.d(TAG, "Checking ${subscriptions.size} subscriptions")
 
-                val announceReels = dependencies.playerPreferences().effectiveSubscriptionShowShorts.first()
+                val announceReels = preferences.effectiveSubscriptionShowShorts.first()
+                val notifyShorts = preferences.notifShortsEnabled.first()
 
                 val newVideos = mutableListOf<NotificationHelper.NewVideoEntry>()
                 subscriptions.chunked(CHANNEL_CHUNK_SIZE).forEach { chunk ->
@@ -186,7 +197,7 @@ class SubscriptionCheckWorker(
                             .map { subscription ->
                                 async {
                                     try {
-                                        checkChannel(subscription, subscriptionRepository, announceReels)
+                                        checkChannel(subscription, subscriptionRepository, announceReels, notifyShorts)
                                     } catch (e: Exception) {
                                         Log.e(TAG, "Error checking channel ${subscription.channelName}", e)
                                         emptyList()
@@ -198,8 +209,10 @@ class SubscriptionCheckWorker(
                     }
                 }
 
-                if (newVideos.isNotEmpty()) {
-                    NotificationHelper.showSubscriptionUpdates(applicationContext, newVideos)
+                // A collaboration two followed channels both list must still notify once.
+                val uniqueVideos = newVideos.distinctBy { it.videoId }
+                if (uniqueVideos.isNotEmpty()) {
+                    NotificationHelper.showSubscriptionUpdates(applicationContext, uniqueVideos)
                 }
 
                 Log.d(TAG, "Subscription check complete. Found ${newVideos.size} new videos.")
@@ -214,6 +227,7 @@ class SubscriptionCheckWorker(
         subscription: ChannelSubscription,
         repository: SubscriptionRepository,
         announceReels: Boolean,
+        notifyShorts: Boolean,
     ): List<NotificationHelper.NewVideoEntry> {
         val feed =
             dependencies.channelRssClient().fetch(subscription.channelId).getOrElse { error ->
@@ -224,7 +238,13 @@ class SubscriptionCheckWorker(
         val latestVideo = feed.entries.firstOrNull() ?: return emptyList()
         if (subscription.lastVideoId == latestVideo.videoId) return emptyList()
 
-        val reelVideoIds = dependencies.channelReelIndex().reelIds(subscription.channelId).orEmpty()
+        val linkedReelIds = feed.entries.filter { it.isShort == true }.mapTo(HashSet()) { it.videoId }
+        val reelVideoIds =
+            if (feed.entries.all { it.isShort != null }) {
+                linkedReelIds
+            } else {
+                linkedReelIds + dependencies.channelReelIndex().reelIds(subscription.channelId).orEmpty()
+            }
 
         // The channel moved on, so hand the whole page to the feed cache. Rows land without a
         // duration — the feed's on-demand enrichment fills that in, and the next full refresh of
@@ -244,13 +264,21 @@ class SubscriptionCheckWorker(
             Log.d(TAG, "${newEntries.size} new video(s) for ${subscription.channelName}")
         }
 
-        return newEntries.filter { announceReels || it.videoId !in reelVideoIds }.map { video ->
-            NotificationHelper.NewVideoEntry(
-                channelName = subscription.channelName,
-                videoTitle = video.title,
-                videoId = video.videoId,
-                thumbnailUrl = video.thumbnailUrl,
-            )
-        }
+        return newEntries
+            .filter {
+                SubscriptionNotificationPolicy.shouldAnnounce(
+                    videoId = it.videoId,
+                    reelVideoIds = reelVideoIds,
+                    announceReelsInFeed = announceReels,
+                    notifyShorts = notifyShorts,
+                )
+            }.map { video ->
+                NotificationHelper.NewVideoEntry(
+                    channelName = subscription.channelName,
+                    videoTitle = video.title,
+                    videoId = video.videoId,
+                    thumbnailUrl = video.thumbnailUrl,
+                )
+            }
     }
 }

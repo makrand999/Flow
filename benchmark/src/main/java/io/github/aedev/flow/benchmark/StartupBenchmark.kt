@@ -3,8 +3,10 @@ package io.github.aedev.flow.benchmark
 import android.content.Intent
 import androidx.benchmark.macro.BaselineProfileMode
 import androidx.benchmark.macro.CompilationMode
+import androidx.benchmark.macro.ExperimentalMetricApi
 import androidx.benchmark.macro.StartupMode
 import androidx.benchmark.macro.StartupTimingMetric
+import androidx.benchmark.macro.TraceSectionMetric
 import androidx.benchmark.macro.junit4.MacrobenchmarkRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -24,6 +26,7 @@ import org.junit.runner.RunWith
  * Run with:
  *   ./gradlew :benchmark:connectedBenchmarkReleaseAndroidTest --no-configuration-cache
  */
+@OptIn(ExperimentalMetricApi::class)
 @RunWith(AndroidJUnit4::class)
 class StartupBenchmark {
     @get:Rule
@@ -48,7 +51,8 @@ class StartupBenchmark {
 
         rule.measureRepeated(
             packageName = targetPackage,
-            metrics = listOf(StartupTimingMetric()),
+            // The engine loads beside the first frame since #1301; its own time shows here.
+            metrics = listOf(StartupTimingMetric(), TraceSectionMetric("neuro.init", TraceSectionMetric.Mode.First)),
             compilationMode = compilationMode,
             startupMode = startupMode,
             iterations = 10,

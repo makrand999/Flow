@@ -47,6 +47,9 @@ object SyncCollection {
     const val FLOW_NEURO_BRAIN = "flow_neuro_brain"
     const val MUSIC_BRAIN = "music_brain"
 
+    /** The user's own notes on channels and videos. */
+    const val NOTES = "notes"
+
     /** Subscription **groups** (the folders), not the channels themselves. */
     const val SUBSCRIPTIONS = "subscriptions"
 
@@ -66,6 +69,7 @@ object SyncCollection {
             MUSIC_BRAIN,
             SUBSCRIBED_CHANNELS,
             SUBSCRIPTIONS,
+            NOTES,
         )
 }
 
@@ -94,6 +98,10 @@ data class Capability(
     val schema: Int,
     val produce: Boolean,
     val consume: Boolean,
+    /** The key spec a collection's topic keys are written in; 0 when it has none or predates them (#907). */
+    val keySpec: Int = 0,
+    /** The language those keys are stemmed for. */
+    val keyLanguage: String = "",
 )
 
 @Serializable

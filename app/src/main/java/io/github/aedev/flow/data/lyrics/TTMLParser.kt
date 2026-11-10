@@ -1,11 +1,12 @@
 package io.github.aedev.flow.data.lyrics
 
 import android.util.Xml
-import org.xmlpull.v1.XmlPullParser
 import org.w3c.dom.Element
 import org.w3c.dom.Node
+import org.xmlpull.v1.XmlPullParser
 import java.io.StringReader
 import javax.xml.parsers.DocumentBuilderFactory
+import kotlin.math.roundToLong
 
 object TTMLParser {
     private const val TTML_PARAMETER_NS = "http://www.w3.org/ns/ttml#parameter"
@@ -15,21 +16,22 @@ object TTMLParser {
         val startTimeMs: Long,
         val endTimeMs: Long,
         val syllables: List<ParsedSyllable>,
-        val isBackground: Boolean = false // e.g. "role=x-bg"
+        // Set for spans with role="x-bg".
+        val isBackground: Boolean = false,
     )
 
     data class ParsedSyllable(
         val text: String,
         val startTimeMs: Long,
         val endTimeMs: Long,
-        val hasTrailingSpace: Boolean
+        val hasTrailingSpace: Boolean,
     )
 
     private data class DomSpan(
         val text: String,
         val startTimeMs: Long,
         val endTimeMs: Long,
-        val hasTrailingSpace: Boolean
+        val hasTrailingSpace: Boolean,
     )
 
     /**
@@ -42,16 +44,17 @@ object TTMLParser {
         if (xmlData.isBlank()) return emptyList()
 
         return try {
-            val factory = DocumentBuilderFactory.newInstance().apply {
-                isNamespaceAware = true
-                trySetFeature("http://xml.org/sax/features/external-general-entities", false)
-                trySetFeature("http://xml.org/sax/features/external-parameter-entities", false)
-                trySetFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
-                try {
-                    isExpandEntityReferences = false
-                } catch (_: Exception) {
+            val factory =
+                DocumentBuilderFactory.newInstance().apply {
+                    isNamespaceAware = true
+                    trySetFeature("http://xml.org/sax/features/external-general-entities", false)
+                    trySetFeature("http://xml.org/sax/features/external-parameter-entities", false)
+                    trySetFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
+                    try {
+                        isExpandEntityReferences = false
+                    } catch (_: Exception) {
+                    }
                 }
-            }
             val doc = factory.newDocumentBuilder().parse(xmlData.byteInputStream())
             val root = doc.documentElement ?: return emptyList()
             val offsetMs = readGlobalOffsetMs(root)
@@ -64,7 +67,10 @@ object TTMLParser {
         }
     }
 
-    private fun DocumentBuilderFactory.trySetFeature(name: String, enabled: Boolean) {
+    private fun DocumentBuilderFactory.trySetFeature(
+        name: String,
+        enabled: Boolean,
+    ) {
         try {
             setFeature(name, enabled)
         } catch (_: Exception) {
@@ -72,17 +78,26 @@ object TTMLParser {
     }
 
     private fun readGlobalOffsetMs(root: Element): Long {
-        val audio = findChild(findChild(root, "head"), "metadata")
-            ?.let { findChild(it, "audio") }
+        val audio =
+            findChild(findChild(root, "head"), "metadata")
+                ?.let { findChild(it, "audio") }
         return audio?.getAttribute("lyricOffset")?.toDoubleOrNull()?.let { (it * 1000).toLong() }
             ?: 0L
     }
 
-    private fun walkDom(element: Element, result: MutableList<LyricsEntry>, offsetMs: Long, parentAgent: String?) {
+    private fun walkDom(
+        element: Element,
+        result: MutableList<LyricsEntry>,
+        offsetMs: Long,
+        parentAgent: String?,
+    ) {
         val name = element.localName ?: element.nodeName.substringAfterLast(':')
         var agent = parentAgent
         when (name) {
-            "div" -> element.ttmlAttr("agent").takeIf { it.isNotBlank() }?.let { agent = it }
+            "div" -> {
+                element.ttmlAttr("agent").takeIf { it.isNotBlank() }?.let { agent = it }
+            }
+
             "p" -> {
                 parseParagraph(element, result, offsetMs, agent)
                 return
@@ -96,7 +111,12 @@ object TTMLParser {
         }
     }
 
-    private fun parseParagraph(p: Element, result: MutableList<LyricsEntry>, offsetMs: Long, divAgent: String?) {
+    private fun parseParagraph(
+        p: Element,
+        result: MutableList<LyricsEntry>,
+        offsetMs: Long,
+        divAgent: String?,
+    ) {
         val beginAttr = p.timingAttr("begin").ifEmpty { findFirstSpanBegin(p).orEmpty() }
         if (beginAttr.isBlank()) return
 
@@ -106,6 +126,7 @@ object TTMLParser {
         val spans = mutableListOf<DomSpan>()
         val backgroundLines = mutableListOf<LyricsEntry>()
         val translations = mutableListOf<String>()
+        val romanizations = mutableListOf<String>()
 
         var child = p.firstChild
         while (child != null) {
@@ -120,10 +141,26 @@ object TTMLParser {
                                 parseBackgroundSpan(child, startMs, offsetMs)?.let { backgroundLines += it }
                             }
                         }
-                        "x-translation", "x-roman" -> child.textContent.orEmpty().trim()
-                            .takeIf { it.isNotBlank() }
-                            ?.let { translations += it }
-                        else -> parseWordSpan(child, offsetMs, spans, child)
+
+                        "x-translation" -> {
+                            child.textContent
+                                .orEmpty()
+                                .trim()
+                                .takeIf { it.isNotBlank() }
+                                ?.let { translations += it }
+                        }
+
+                        "x-roman" -> {
+                            child.textContent
+                                .orEmpty()
+                                .trim()
+                                .takeIf { it.isNotBlank() }
+                                ?.let { romanizations += it }
+                        }
+
+                        else -> {
+                            parseWordSpan(child, offsetMs, spans, child)
+                        }
                     }
                 }
             }
@@ -131,32 +168,42 @@ object TTMLParser {
         }
 
         val words = mergeSpansIntoWords(spans)
-        val text = if (words.isNotEmpty()) {
-            buildLineText(words)
-        } else {
-            directText(p).trim()
-        }
+        val text =
+            if (words.isNotEmpty()) {
+                buildLineText(words)
+            } else {
+                directText(p).trim()
+            }
 
         if (text.isNotBlank()) {
-            result += LyricsEntry(
-                time = startMs,
-                text = text,
-                words = words.takeIf { it.isNotEmpty() },
-                agent = agent,
-                isBackground = isBackground,
-                translation = translations.joinToString("\n").ifBlank { null }
-            )
+            result +=
+                LyricsEntry(
+                    time = startMs,
+                    text = text,
+                    words = words.takeIf { it.isNotEmpty() },
+                    agent = agent,
+                    isBackground = isBackground,
+                    translation = translations.joinToString("\n").ifBlank { null },
+                    romanization = romanizations.joinToString("\n").ifBlank { null },
+                )
         }
         result += backgroundLines
     }
 
-    private fun parseBackgroundSpan(span: Element, parentStartMs: Long, offsetMs: Long): LyricsEntry? {
-        val startMs = span.timingAttr("begin")
-            .takeIf { it.isNotBlank() }
-            ?.let { parseTime(it) + offsetMs }
-            ?: parentStartMs
+    private fun parseBackgroundSpan(
+        span: Element,
+        parentStartMs: Long,
+        offsetMs: Long,
+    ): LyricsEntry? {
+        val startMs =
+            span
+                .timingAttr("begin")
+                .takeIf { it.isNotBlank() }
+                ?.let { parseTime(it) + offsetMs }
+                ?: parentStartMs
         val spans = mutableListOf<DomSpan>()
         val translations = mutableListOf<String>()
+        val romanizations = mutableListOf<String>()
 
         var hasChildSpans = false
         var child = span.firstChild
@@ -166,12 +213,15 @@ object TTMLParser {
                 if (name == "span") {
                     hasChildSpans = true
                     val role = child.ttmlAttr("role")
-                    if (role != "x-translation" && role != "x-roman") {
-                        parseWordSpan(child, offsetMs, spans, child)
-                    } else {
-                        child.textContent.orEmpty().trim()
+                    val content =
+                        child.textContent
+                            .orEmpty()
+                            .trim()
                             .takeIf { it.isNotBlank() }
-                            ?.let { translations += it }
+                    when (role) {
+                        "x-translation" -> content?.let { translations += it }
+                        "x-roman" -> content?.let { romanizations += it }
+                        else -> parseWordSpan(child, offsetMs, spans, child)
                     }
                 }
             }
@@ -179,11 +229,12 @@ object TTMLParser {
         }
 
         val words = mergeSpansIntoWords(spans)
-        val text = when {
-            words.isNotEmpty() -> buildLineText(words)
-            !hasChildSpans -> span.textContent.orEmpty().trim()
-            else -> directText(span).trim()
-        }
+        val text =
+            when {
+                words.isNotEmpty() -> buildLineText(words)
+                !hasChildSpans -> span.textContent.orEmpty().trim()
+                else -> directText(span).trim()
+            }
         if (text.isBlank()) return null
 
         return LyricsEntry(
@@ -192,25 +243,33 @@ object TTMLParser {
             words = words.takeIf { it.isNotEmpty() },
             agent = "bg",
             isBackground = true,
-            translation = translations.joinToString("\n").ifBlank { null }
+            translation = translations.joinToString("\n").ifBlank { null },
+            romanization = romanizations.joinToString("\n").ifBlank { null },
         )
     }
 
-    private fun parseWordSpan(span: Element, offsetMs: Long, spans: MutableList<DomSpan>, node: Node) {
+    private fun parseWordSpan(
+        span: Element,
+        offsetMs: Long,
+        spans: MutableList<DomSpan>,
+        node: Node,
+    ) {
         val begin = span.timingAttr("begin")
         val end = span.timingAttr("end")
         val text = span.textContent.orEmpty()
         if (begin.isBlank() || end.isBlank()) return
 
         val next = node.nextSibling
-        val hasTrailingSpace = (text.lastOrNull()?.isWhitespace() == true) ||
-            (next?.nodeType == Node.TEXT_NODE && next.textContent?.firstOrNull()?.isWhitespace() == true)
-        spans += DomSpan(
-            text = text,
-            startTimeMs = parseTime(begin) + offsetMs,
-            endTimeMs = parseTime(end) + offsetMs,
-            hasTrailingSpace = hasTrailingSpace
-        )
+        val hasTrailingSpace =
+            (text.lastOrNull()?.isWhitespace() == true) ||
+                (next?.nodeType == Node.TEXT_NODE && next.textContent?.firstOrNull()?.isWhitespace() == true)
+        spans +=
+            DomSpan(
+                text = text,
+                startTimeMs = parseTime(begin) + offsetMs,
+                endTimeMs = parseTime(end) + offsetMs,
+                hasTrailingSpace = hasTrailingSpace,
+            )
     }
 
     private fun mergeSpansIntoWords(spans: List<DomSpan>): List<WordTimestamp> {
@@ -242,12 +301,13 @@ object TTMLParser {
         return words
     }
 
-    private fun buildLineText(words: List<WordTimestamp>): String = buildString {
-        words.forEachIndexed { index, word ->
-            append(word.text)
-            if (!word.text.endsWith('-') && index < words.lastIndex) append(' ')
-        }
-    }.trim()
+    private fun buildLineText(words: List<WordTimestamp>): String =
+        buildString {
+            words.forEachIndexed { index, word ->
+                append(word.text)
+                if (!word.text.endsWith('-') && index < words.lastIndex) append(' ')
+            }
+        }.trim()
 
     private fun directText(element: Element): String {
         val sb = StringBuilder()
@@ -290,7 +350,10 @@ object TTMLParser {
         return best
     }
 
-    private fun findChild(parent: Element?, localName: String): Element? {
+    private fun findChild(
+        parent: Element?,
+        localName: String,
+    ): Element? {
         var child = parent?.firstChild
         while (child != null) {
             if (child is Element) {
@@ -334,22 +397,22 @@ object TTMLParser {
                                 currentWordText,
                                 currentWordStart,
                                 currentWordEnd,
-                                true
-                            )
+                                true,
+                            ),
                         )
                         currentWordText = ""
                         currentWordStart = -1L
                     }
                 }
-                
+
                 if (currentWordText.isNotEmpty()) {
                     finalWords.add(
                         ParsedSyllable(
                             currentWordText,
                             currentWordStart,
                             currentWordEnd,
-                            false
-                        )
+                            false,
+                        ),
                     )
                 }
 
@@ -360,14 +423,15 @@ object TTMLParser {
                 val ss = (line.startTimeMs % 60000) / 1000
                 val ms = line.startTimeMs % 1000
                 val lineTimeStr = String.format("[%02d:%02d.%03d]", mm, ss, ms)
-                
+
                 appendLine("$lineTimeStr $fullLineText")
 
-                val wordsStr = finalWords.joinToString("|") { w ->
-                    val wStartSec = w.startTimeMs / 1000.0
-                    val wEndSec = w.endTimeMs / 1000.0
-                    "${w.text}:$wStartSec:$wEndSec"
-                }
+                val wordsStr =
+                    finalWords.joinToString("|") { w ->
+                        val wStartSec = w.startTimeMs / 1000.0
+                        val wEndSec = w.endTimeMs / 1000.0
+                        "${w.text}:$wStartSec:$wEndSec"
+                    }
                 appendLine("<$wordsStr>")
             }
         }
@@ -394,10 +458,14 @@ object TTMLParser {
                 when (eventType) {
                     XmlPullParser.START_TAG -> {
                         when (parser.name) {
-                            "body" -> inBody = true
+                            "body" -> {
+                                inBody = true
+                            }
+
                             "div" -> {
                                 if (inBody) inDiv = true
                             }
+
                             "p" -> {
                                 if (inBody && inDiv) {
                                     currentLine = mutableListOf()
@@ -410,6 +478,7 @@ object TTMLParser {
                                     currentLineIsBackground = (roleStr == "x-bg")
                                 }
                             }
+
                             "span" -> {
                                 if (currentLine != null) {
                                     val bgnStr = parser.getAttributeValue(null, "begin")
@@ -431,18 +500,25 @@ object TTMLParser {
                                                 cleanText,
                                                 sStart,
                                                 sEnd,
-                                                hasTrailingSpace = hasSpace
-                                            )
+                                                hasTrailingSpace = hasSpace,
+                                            ),
                                         )
                                     }
                                 }
                             }
                         }
                     }
+
                     XmlPullParser.END_TAG -> {
-                         when (parser.name) {
-                            "body" -> inBody = false
-                            "div" -> inDiv = false
+                        when (parser.name) {
+                            "body" -> {
+                                inBody = false
+                            }
+
+                            "div" -> {
+                                inDiv = false
+                            }
+
                             "p" -> {
                                 if (currentLine != null) {
                                     if (currentLine.isNotEmpty()) {
@@ -451,57 +527,51 @@ object TTMLParser {
                                                 startTimeMs = currentLineStart,
                                                 endTimeMs = currentLineEnd,
                                                 syllables = currentLine,
-                                                isBackground = currentLineIsBackground
-                                            )
+                                                isBackground = currentLineIsBackground,
+                                            ),
                                         )
                                     }
                                     currentLine = null
                                 }
                             }
-                         }
+                        }
                     }
                 }
                 eventType = parser.next()
             }
-
         } catch (e: Exception) {
             e.printStackTrace()
         }
         return result
     }
 
+    /**
+     * TTML offset times ("9.446s", "9446ms"), clock times ("0:01:02.345") and the shapes Apple
+     * Music TTML actually uses: bare seconds ("9.446") and minutes with seconds ("1:02.345").
+     */
     private fun parseTime(timeStr: String?): Long {
-        if (timeStr.isNullOrBlank()) return 0L
-        try {
-            if (timeStr.endsWith("ms")) {
-                return timeStr.replace("ms", "").toLongOrNull() ?: 0L
-            }
-            if (timeStr.endsWith("s")) {
-                val secStr = timeStr.replace("s", "")
-                val secDouble = secStr.toDoubleOrNull() ?: 0.0
-                return (secDouble * 1000).toLong()
-            }
-            if (timeStr.contains(":")) {
-                val parts = timeStr.trim().split(":")
-                if (parts.size == 3) {
-                    val h = parts[0].toLongOrNull() ?: 0L
-                    val m = parts[1].toLongOrNull() ?: 0L
-                    
-                    val sParts = parts[2].split(".")
-                    val s = sParts[0].toLongOrNull() ?: 0L
-                    var ms = 0L
-                    if (sParts.size > 1) {
-                         var msStr = sParts[1]
-                         if (msStr.length > 3) msStr = msStr.substring(0, 3)
-                         while (msStr.length < 3) msStr += "0"
-                         ms = msStr.toLongOrNull() ?: 0L
-                    }
-                    return (h * 3600000) + (m * 60000) + (s * 1000) + ms
+        val time = timeStr?.trim().orEmpty()
+        if (time.isEmpty()) return 0L
+        val seconds =
+            when {
+                time.endsWith("ms") -> {
+                    time.removeSuffix("ms").toDoubleOrNull()?.div(1000)
                 }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        return 0L
+
+                time.endsWith("s") -> {
+                    time.removeSuffix("s").toDoubleOrNull()
+                }
+
+                ':' in time -> {
+                    val parts = time.split(':').map { it.toDoubleOrNull() ?: return 0L }
+                    if (parts.size > 3) return 0L
+                    parts.fold(0.0) { total, part -> total * 60 + part }
+                }
+
+                else -> {
+                    time.toDoubleOrNull()
+                }
+            } ?: return 0L
+        return (seconds * 1000).roundToLong()
     }
 }

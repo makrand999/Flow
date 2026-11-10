@@ -5,6 +5,8 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.aedev.flow.data.local.safePreferencesDataStore
+import io.github.aedev.flow.data.profile.StoreScope
+import io.github.aedev.flow.sync.canonical.BrainLwwMaps
 import io.github.aedev.flow.sync.canonical.BrainSets
 import io.github.aedev.flow.sync.canonical.CanonicalBrain
 import io.github.aedev.flow.sync.canonical.CanonicalChannelStrike
@@ -16,7 +18,7 @@ import kotlinx.serialization.json.Json
 import javax.inject.Inject
 import javax.inject.Singleton
 
-private val Context.brainCrdtDataStore by safePreferencesDataStore(name = "sync_brain_crdt")
+private val Context.brainCrdtDataStore by safePreferencesDataStore(name = "sync_brain_crdt", scope = StoreScope.PROFILE_PRIVATE)
 
 /**
  * The sync-owned CRDT state that the FlowNeuro brain itself cannot hold, persisted alongside it:
@@ -32,6 +34,9 @@ private val Context.brainCrdtDataStore by safePreferencesDataStore(name = "sync_
  * - **Wire-only fields** the Android brain has no home for ([watchSignalProgress],
  *   [channelStrikes]). Keeping them here is what lets a third device receive them through the
  *   phone instead of the phone silently erasing them on every round-trip.
+ * - **Every device's learned vectors** ([deviceVectors]), which [BrainVectorBlend] averages.
+ * - **The LWW values as last merged** ([syncedLww]), so a value that has not changed since keeps
+ *   its stamp instead of being restamped on every export and beating a newer edit from a peer.
  */
 @Serializable
 data class BrainCrdtState(
@@ -44,6 +49,11 @@ data class BrainCrdtState(
     val sets: BrainSets = BrainSets(),
     val watchSignalProgress: Map<String, Float> = emptyMap(),
     val channelStrikes: Map<String, Lww<CanonicalChannelStrike>> = emptyMap(),
+    val deviceVectors: Map<String, DeviceVectors> = emptyMap(),
+    val syncedLww: BrainLwwMaps = BrainLwwMaps(),
+    /** The key spec and key language the topic-keyed state above is written in; see [BrainKeyRekey]. */
+    val keySpec: Int = 1,
+    val keyLanguage: String = "",
 ) {
     companion object {
         /**
@@ -124,6 +134,7 @@ data class BrainCrdtState(
         fun afterMerge(
             state: BrainCrdtState,
             merged: CanonicalBrain,
+            deviceVectors: Map<String, DeviceVectors>,
         ): BrainCrdtState =
             state.copy(
                 idfDocs = merged.counters.idfTotalDocuments.perDevice,
@@ -135,6 +146,8 @@ data class BrainCrdtState(
                 sets = merged.sets,
                 watchSignalProgress = merged.perVideo.watchSignalProgress,
                 channelStrikes = merged.lwwMaps.channelStrikes,
+                deviceVectors = deviceVectors,
+                syncedLww = merged.lwwMaps,
             )
     }
 }

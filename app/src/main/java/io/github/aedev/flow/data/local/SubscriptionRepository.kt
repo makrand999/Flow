@@ -6,13 +6,22 @@ import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
+import io.github.aedev.flow.data.engagement.FeedInvalidationBus
 import io.github.aedev.flow.data.local.AppDatabase
+import io.github.aedev.flow.data.profile.StoreScope
 import io.github.aedev.flow.utils.ThumbnailUrlResolver
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 
-private val Context.subscriptionsDataStore: DataStore<Preferences> by safePreferencesDataStore(name = "subscriptions")
+private val Context.subscriptionsDataStore: DataStore<Preferences> by safePreferencesDataStore(
+    name = "subscriptions",
+    scope = StoreScope.PROFILE_LIBRARY,
+)
 
 class SubscriptionRepository private constructor(
     private val context: Context,
@@ -122,9 +131,10 @@ class SubscriptionRepository private constructor(
         }
 
         AppDatabase
-            .getDatabase(context)
+            .profile(context)
             .cacheDao()
             .deleteSubscriptionFeedForChannel(channelId)
+        FeedInvalidationBus.emit(FeedInvalidationBus.Event.ChannelUnsubscribed(channelId))
     }
 
     /**
@@ -151,6 +161,12 @@ class SubscriptionRepository private constructor(
                 }
             }
         }
+
+    /** The channels whose bell is on. */
+    fun notifyingChannelIds(): Flow<Set<String>> =
+        getAllSubscriptions()
+            .map(::notifyingIds)
+            .distinctUntilChanged()
 
     /**
      * Get all subscription IDs as a Set
@@ -229,10 +245,10 @@ class SubscriptionRepository private constructor(
         val subscriptions = getAllSubscriptions().first()
         val repairs =
             subscriptions
-                .filter { ThumbnailUrlResolver.isYoutubeVideoThumbnail(it.channelThumbnail) }
+                .filter { ThumbnailUrlResolver.isUnusableChannelAvatar(it.channelThumbnail) }
                 .mapNotNull { subscription ->
                     val avatar = fetchChannelThumbnail(subscription.channelId).trim()
-                    if (avatar.isNotEmpty() && !ThumbnailUrlResolver.isYoutubeVideoThumbnail(avatar)) {
+                    if (avatar.isNotEmpty() && !ThumbnailUrlResolver.isUnusableChannelAvatar(avatar)) {
                         subscription.channelId to subscription.copy(channelThumbnail = avatar)
                     } else {
                         null
@@ -249,15 +265,14 @@ class SubscriptionRepository private constructor(
         return repairs.size
     }
 
-    private fun serializeChannel(channel: ChannelSubscription): String =
-        "${channel.channelId}|${channel.channelName}|${channel.channelThumbnail}|${channel.subscribedAt}|${channel.lastVideoId ?: ""}|${channel.lastCheckTime}|${channel.isNotificationEnabled}|${channel.isMusic}|${channel.lastFeedFetchAt}"
+    private fun serializeChannel(channel: ChannelSubscription): String = SubscriptionRecordCodec.encode(channel)
 
     private fun ChannelSubscription.withPreservedThumbnail(preferences: Preferences): ChannelSubscription {
         val existing = preferences[channelKey(channelId)]?.let { deserializeChannel(it) }
         return if (
-            ThumbnailUrlResolver.isYoutubeVideoThumbnail(channelThumbnail) &&
+            ThumbnailUrlResolver.isUnusableChannelAvatar(channelThumbnail) &&
             existing?.channelThumbnail?.isNotBlank() == true &&
-            !ThumbnailUrlResolver.isYoutubeVideoThumbnail(existing.channelThumbnail)
+            !ThumbnailUrlResolver.isUnusableChannelAvatar(existing.channelThumbnail)
         ) {
             copy(channelThumbnail = existing.channelThumbnail)
         } else {
@@ -265,27 +280,7 @@ class SubscriptionRepository private constructor(
         }
     }
 
-    private fun deserializeChannel(data: String): ChannelSubscription? =
-        try {
-            val parts = data.split("|")
-            if (parts.size >= 4) {
-                ChannelSubscription(
-                    channelId = parts[0],
-                    channelName = parts[1],
-                    channelThumbnail = parts[2],
-                    subscribedAt = parts[3].toLong(),
-                    lastVideoId = if (parts.size > 4 && parts[4].isNotEmpty()) parts[4] else null,
-                    lastCheckTime = if (parts.size > 5 && parts[5].isNotEmpty()) parts[5].toLong() else 0L,
-                    isNotificationEnabled = if (parts.size > 6 && parts[6].isNotEmpty()) parts[6].toBoolean() else false,
-                    isMusic = if (parts.size > 7 && parts[7].isNotEmpty()) parts[7].toBoolean() else false,
-                    lastFeedFetchAt = if (parts.size > 8 && parts[8].isNotEmpty()) parts[8].toLong() else 0L,
-                )
-            } else {
-                null
-            }
-        } catch (e: Exception) {
-            null
-        }
+    private fun deserializeChannel(data: String): ChannelSubscription? = SubscriptionRecordCodec.decode(data)
 
     /**
      * Update the notification state for a channel
@@ -294,6 +289,7 @@ class SubscriptionRepository private constructor(
         channelId: String,
         enabled: Boolean,
     ) {
+        var turnedOn = false
         context.subscriptionsDataStore.edit { preferences ->
             val channelData = preferences[channelKey(channelId)]
             if (channelData != null) {
@@ -301,10 +297,19 @@ class SubscriptionRepository private constructor(
                 if (subscription != null) {
                     val updated = subscription.copy(isNotificationEnabled = enabled)
                     preferences[channelKey(channelId)] = serializeChannel(updated)
+                    turnedOn = enabled && !subscription.isNotificationEnabled
                 }
             }
         }
+        if (turnedOn) bellsTurnedOn.tryEmit(channelId)
     }
+
+    // Every bell in the app writes through updateNotificationState, so this is the one place that
+    // knows a viewer just asked for alerts. Nothing replays: with no shell listening, it is dropped.
+    private val bellsTurnedOn = MutableSharedFlow<String>(extraBufferCapacity = 1)
+
+    /** A channel whose bell the viewer just turned on. */
+    val notificationsTurnedOn: SharedFlow<String> = bellsTurnedOn.asSharedFlow()
 
     /**
      * Record that the subscription feed has just fetched these channels.
@@ -366,3 +371,6 @@ data class ChannelSubscription(
     /** When the subscription feed last fetched this channel; 0 means never. */
     val lastFeedFetchAt: Long = 0L,
 )
+
+internal fun notifyingIds(subscriptions: List<ChannelSubscription>): Set<String> =
+    subscriptions.filter { it.isNotificationEnabled }.mapTo(HashSet()) { it.channelId }

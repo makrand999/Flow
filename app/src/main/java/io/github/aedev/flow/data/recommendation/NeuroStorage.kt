@@ -1,7 +1,7 @@
 /*
  * Copyright (C) 2025-2026 Flow | A-EDev
  *
- * This file is part of Flow (https://github.com/A-EDev/Flow).
+ * This file is part of Flow (https://github.com/Flow-Tube/Flow).
  *
  * Flow is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,14 +17,22 @@ package io.github.aedev.flow.data.recommendation
 import android.content.Context
 import android.util.Log
 import androidx.datastore.core.DataStore
+import androidx.datastore.core.DataStoreFactory
 import androidx.datastore.core.Serializer
-import androidx.datastore.dataStore
+import io.github.aedev.flow.data.profile.ProfileFiles
+import io.github.aedev.flow.data.profile.StoreScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.encodeToStream
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.json.JSONObject
 import java.io.File
 import java.io.InputStream
@@ -40,7 +48,26 @@ internal class NeuroStorage(
     companion object {
         private const val TAG = "FlowNeuroEngine"
         private const val BRAIN_FILENAME = "user_neuro_brain.json"
-        private const val SCHEMA_VERSION = 15
+        private const val BRAIN_DATASTORE_FILE = "flow_neuro_brain_v10.json"
+        private val PREVIOUS_DATASTORE_FILES = listOf("v9", "v8", "v7").map { "flow_neuro_brain_$it.json" }
+        private const val SCHEMA_VERSION = NeuroMaintenance.TARGET_SCHEMA_VERSION
+        private const val PRE_MIGRATION_PREFIX = "neuro_brain_before_v"
+
+        /** The schema of a brain that predates the field, so every maintenance step runs on it. */
+        const val LEGACY_SCHEMA_VERSION = 0
+
+        private val LEGACY_ONLY_KEYS = listOf("morning", "afternoon", "evening", "night", "longTerm")
+
+        private val exportJson = Json { encodeDefaults = true }
+
+        /** The schema [json] declares, or [LEGACY_SCHEMA_VERSION] when it has none. */
+        internal fun declaredSchema(json: JsonObject): Int = json["schemaVersion"]?.jsonPrimitive?.intOrNull ?: LEGACY_SCHEMA_VERSION
+
+        /**
+         * An export from before time buckets, which only the legacy parser reads. Today's format can
+         * hold empty time vectors, so having none says nothing about its age (#907).
+         */
+        internal fun isLegacyFormat(json: JsonObject): Boolean = LEGACY_ONLY_KEYS.any { it in json }
     }
 
     // ── Serializable models ──
@@ -99,6 +126,7 @@ internal class NeuroStorage(
         val seenShortsHistory: Map<String, Long> = emptyMap(),
         val channelTopicProfiles: Map<String, Map<String, Double>> = emptyMap(),
         val shortsVector: SerializableVector = SerializableVector(),
+        val recentVector: SerializableVector = SerializableVector(),
         val suppressedVideoIds: Map<String, Long> = emptyMap(),
         val suppressedChannels: Map<String, Long> = emptyMap(),
         val rejectionPatterns: Map<String, SerializableRejectionSignal> = emptyMap(),
@@ -106,9 +134,41 @@ internal class NeuroStorage(
         val recentQueryTokens: List<List<String>> = emptyList(),
         val topicEvidence: Map<String, SerializableTopicEvidence> = emptyMap(),
         val recentRelatedSeeds: Map<String, Long> = emptyMap(),
+        val recentShortsSeeds: Map<String, Long> = emptyMap(),
         val staleQueries: Map<String, Long> = emptyMap(),
         val clusterRotation: Map<String, Long> = emptyMap(),
         val tagAffinities: Map<String, Double> = emptyMap(),
+        val timeBucketCounts: Map<String, Int> = emptyMap(),
+        val channelMemory: Map<String, SerializableChannelMemoryEntry> = emptyMap(),
+        val channelMemoryClearedAt: Long = 0L,
+        val interestChipMasses: Map<String, Double> = emptyMap(),
+        val interestChipsComputedAt: Long = 0L,
+        val displayForms: Map<String, DisplayForm> = emptyMap(),
+        val formatAffinity: Map<String, Double> = emptyMap(),
+        val categoryAffinity: Map<String, Double> = emptyMap(),
+        val languageProfile: String? = null,
+        val languageVotes: Map<String, Int> = emptyMap(),
+        val keyLanguage: String? = null,
+    )
+
+    @Serializable
+    data class SerializableRememberedUpload(
+        val videoId: String = "",
+        val title: String = "",
+        val thumbnailUrl: String = "",
+        val durationSec: Int = 0,
+        val publishedAt: Long = 0L,
+        val uploadDate: String = "",
+        val viewCount: Long = 0L,
+    )
+
+    @Serializable
+    data class SerializableChannelMemoryEntry(
+        val name: String = "",
+        val lastFetchedAt: Long = 0L,
+        val uploads: List<SerializableRememberedUpload> = emptyList(),
+        val rejectedAt: Long = 0L,
+        val forgottenAt: Long = 0L,
     )
 
     // ── DataStore setup ──
@@ -142,11 +202,17 @@ internal class NeuroStorage(
         }
     }
 
-    private val Context.brainDataStore: DataStore<SerializableBrain>
-        by dataStore(
-            fileName = "flow_neuro_brain_v10.json",
+    private val brainDataStore: DataStore<SerializableBrain> by lazy {
+        DataStoreFactory.create(
             serializer = BrainSerializer,
+            produceFile = ::brainFile,
         )
+    }
+
+    private fun brainFile() = ProfileFiles.dataStore(appContext, StoreScope.PROFILE_PRIVATE, BRAIN_DATASTORE_FILE)
+
+    // Legacy formats exist only in Default; elsewhere these resolve inside the profile's own folder and are absent.
+    private fun previousBrainFile(fileName: String) = ProfileFiles.dataStore(appContext, StoreScope.DEFAULT_ONLY, fileName)
 
     // ── Conversion functions ──
 
@@ -185,7 +251,7 @@ internal class NeuroStorage(
 
     fun UserBrain.toSerializable() =
         SerializableBrain(
-            schemaVersion = SCHEMA_VERSION,
+            schemaVersion = schemaVersion,
             timeVectors =
                 timeVectors
                     .map { (k, v) ->
@@ -208,6 +274,7 @@ internal class NeuroStorage(
             seenShortsHistory = seenShortsHistory,
             channelTopicProfiles = channelTopicProfiles,
             shortsVector = shortsVector.toSerializable(),
+            recentVector = recentVector.toSerializable(),
             suppressedVideoIds = suppressedVideoIds,
             suppressedChannels = suppressedChannels,
             rejectionPatterns =
@@ -218,9 +285,41 @@ internal class NeuroStorage(
             recentQueryTokens = recentQueryTokens.map { it.toList() },
             topicEvidence = topicEvidence.mapValues { (_, v) -> v.toSerializable() },
             recentRelatedSeeds = recentRelatedSeeds,
+            recentShortsSeeds = recentShortsSeeds,
             staleQueries = staleQueries,
             clusterRotation = clusterRotation,
             tagAffinities = tagAffinities,
+            timeBucketCounts = timeBucketCounts.mapKeys { it.key.name },
+            channelMemory = channelMemory.entries.mapValues { (_, entry) -> entry.toSerializable() },
+            channelMemoryClearedAt = channelMemory.clearedAt,
+            interestChipMasses = interestChips.masses,
+            interestChipsComputedAt = interestChips.computedAt,
+            displayForms = displayForms,
+            formatAffinity = formatAffinity,
+            categoryAffinity = categoryAffinity,
+            languageProfile = languageProfile,
+            languageVotes = languageVotes,
+            keyLanguage = keyLanguage,
+        )
+
+    private fun ChannelMemoryEntry.toSerializable() =
+        SerializableChannelMemoryEntry(
+            name = name,
+            lastFetchedAt = lastFetchedAt,
+            uploads =
+                uploads.map {
+                    SerializableRememberedUpload(
+                        it.videoId,
+                        it.title,
+                        it.thumbnailUrl,
+                        it.durationSec,
+                        it.publishedAt,
+                        it.uploadDate,
+                        it.viewCount,
+                    )
+                },
+            rejectedAt = rejectedAt,
+            forgottenAt = forgottenAt,
         )
 
     // ── Persistence operations ──
@@ -228,7 +327,7 @@ internal class NeuroStorage(
     suspend fun save(brain: UserBrain) =
         withContext(Dispatchers.IO) {
             try {
-                appContext.brainDataStore.updateData {
+                brainDataStore.updateData {
                     brain.toSerializable()
                 }
             } catch (e: Exception) {
@@ -239,7 +338,7 @@ internal class NeuroStorage(
     suspend fun load(): UserBrain? =
         withContext(Dispatchers.IO) {
             try {
-                val data = appContext.brainDataStore.data.first()
+                val data = brainDataStore.data.first()
                 if (data.hasAnyUserState()) {
                     val brain = data.toUserBrain()
                     Log.i(
@@ -281,18 +380,15 @@ internal class NeuroStorage(
             global.topics.isNotEmpty() ||
             timeVectors.any { (_, vector) -> vector.topics.isNotEmpty() }
 
+    @OptIn(ExperimentalSerializationApi::class)
     suspend fun exportToStream(
         brain: UserBrain,
         output: OutputStream,
     ): Boolean =
         withContext(Dispatchers.IO) {
             try {
-                val brainCopy = brain.toSerializable()
-                val jsonBytes =
-                    Json { encodeDefaults = true }
-                        .encodeToString(brainCopy)
-                        .toByteArray()
-                output.write(jsonBytes)
+                // Straight into the stream: a string and then its bytes held the whole brain twice.
+                exportJson.encodeToStream(brain.toSerializable(), output)
                 output.flush()
                 Log.i(TAG, "Brain exported")
                 true
@@ -311,17 +407,13 @@ internal class NeuroStorage(
                 val imported =
                     jsonParser
                         .decodeFromString<SerializableBrain>(text)
-
-                val hasTimeData =
-                    imported.timeVectors.any { (_, v) ->
-                        v.topics.isNotEmpty()
-                    }
+                val json = jsonParser.parseToJsonElement(text).jsonObject
 
                 val finalBrain =
-                    if (hasTimeData) {
-                        imported.toUserBrain()
-                    } else {
+                    if (isLegacyFormat(json)) {
                         migrateLegacyBackup(text, imported)
+                    } else {
+                        imported.toUserBrain().copy(schemaVersion = declaredSchema(json))
                     }
 
                 Log.i(
@@ -342,7 +434,7 @@ internal class NeuroStorage(
 
     suspend fun migrateLegacy(): UserBrain? =
         withContext(Dispatchers.IO) {
-            val legacyFile = File(appContext.filesDir, BRAIN_FILENAME)
+            val legacyFile = ProfileFiles.file(appContext, StoreScope.DEFAULT_ONLY, BRAIN_FILENAME)
             if (legacyFile.exists()) {
                 try {
                     Log.i(TAG, "Migrating legacy JSON brain...")
@@ -366,13 +458,46 @@ internal class NeuroStorage(
             tryMigrateFromPreviousDataStore()
         }
 
-    fun deleteLegacyFile() {
-        val legacyFile = File(appContext.filesDir, BRAIN_FILENAME)
-        if (legacyFile.exists()) {
-            legacyFile.delete()
-            Log.i(TAG, "Migrated legacy brain to DataStore")
-        }
+    /**
+     * Keeps [brain] as it was before migration [toSchema] for one release, so a migration that went
+     * wrong can be undone. noBackupFilesDir never leaves the device.
+     */
+    suspend fun keepCopyBeforeMigration(
+        brain: UserBrain,
+        toSchema: Int,
+    ) = withContext(Dispatchers.IO) {
+        val file = File(ProfileFiles.noBackupRoot(appContext), "$PRE_MIGRATION_PREFIX$toSchema.json")
+        if (file.exists()) return@withContext
+        runCatching {
+            file.parentFile?.mkdirs()
+            file.writeText(Json { encodeDefaults = true }.encodeToString(brain.toSerializable()))
+        }.onFailure { Log.e(TAG, "Could not keep the brain before migration $toSchema", it) }
     }
+
+    /** Removes the copies [keepCopyBeforeMigration] kept: a reset forgets what was learned. */
+    suspend fun deleteCopiesBeforeMigration() =
+        withContext(Dispatchers.IO) {
+            ProfileFiles
+                .noBackupRoot(appContext)
+                .listFiles { file -> file.name.startsWith(PRE_MIGRATION_PREFIX) }
+                ?.forEach { it.delete() }
+        }
+
+    /** True once any brain, even an empty one after a reset, has been saved in the current format. */
+    suspend fun hasSavedBrain(): Boolean = withContext(Dispatchers.IO) { brainFile().exists() }
+
+    /** Removes the brain files of earlier formats once a current one is saved, so nothing can bring an old brain back. */
+    suspend fun deleteOldBrainFiles() =
+        withContext(Dispatchers.IO) {
+            if (!brainFile().exists()) return@withContext
+            (
+                listOf(ProfileFiles.file(appContext, StoreScope.DEFAULT_ONLY, BRAIN_FILENAME)) +
+                    PREVIOUS_DATASTORE_FILES.map(::previousBrainFile)
+            ).filter { it.exists() }
+                .forEach { file ->
+                    if (file.delete()) Log.i(TAG, "Deleted old brain file ${file.name}")
+                }
+        }
 
     fun migrateLegacyBackup(
         rawJson: String,
@@ -518,25 +643,21 @@ internal class NeuroStorage(
                         partialParse.idfTotalDocuments
                     },
                 watchHistoryMap = partialParse.watchHistoryMap,
+                schemaVersion = LEGACY_SCHEMA_VERSION,
             )
         } catch (e: Exception) {
             Log.e(TAG, "Legacy backup migration failed", e)
-            return partialParse.toUserBrain()
+            return partialParse.toUserBrain().copy(schemaVersion = LEGACY_SCHEMA_VERSION)
         }
     }
 
-    suspend fun tryMigrateFromPreviousDataStore(): UserBrain? {
-        val versions = listOf("v9", "v8", "v7")
-        for (version in versions) {
+    private suspend fun tryMigrateFromPreviousDataStore(): UserBrain? {
+        for (fileName in PREVIOUS_DATASTORE_FILES) {
             try {
-                val file =
-                    File(
-                        appContext.filesDir,
-                        "datastore/flow_neuro_brain_$version.json",
-                    )
+                val file = previousBrainFile(fileName)
                 if (!file.exists()) continue
 
-                Log.i(TAG, "Found $version DataStore, migrating to V9...")
+                Log.i(TAG, "Found $fileName, migrating...")
                 val text = file.readText()
                 if (text.isBlank()) continue
 
@@ -548,16 +669,16 @@ internal class NeuroStorage(
                     data.hasCompletedOnboarding ||
                     data.preferredTopics.isNotEmpty()
                 ) {
-                    val brain = data.toUserBrain()
+                    val brain = data.toUserBrain().copy(schemaVersion = declaredSchema(Json.parseToJsonElement(text).jsonObject))
                     Log.i(
                         TAG,
-                        "Migrated $version brain " +
+                        "Migrated $fileName " +
                             "(${data.interactions} interactions)",
                     )
                     return brain
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "$version migration failed", e)
+                Log.e(TAG, "$fileName migration failed", e)
             }
         }
         return null
@@ -641,6 +762,7 @@ internal fun NeuroStorage.SerializableBrain.toUserBrain(): UserBrain {
         seenShortsHistory = seenShortsHistory,
         channelTopicProfiles = channelTopicProfiles,
         shortsVector = shortsVector.toContentVector(),
+        recentVector = recentVector.toContentVector(),
         suppressedVideoIds = suppressedVideoIds,
         suppressedChannels = suppressedChannels,
         rejectionPatterns =
@@ -651,9 +773,47 @@ internal fun NeuroStorage.SerializableBrain.toUserBrain(): UserBrain {
         recentQueryTokens = recentQueryTokens.map { it.toSet() },
         topicEvidence = topicEvidence.mapValues { (_, v) -> v.toTopicEvidence() },
         recentRelatedSeeds = recentRelatedSeeds,
+        recentShortsSeeds = recentShortsSeeds,
         staleQueries = staleQueries,
         clusterRotation = clusterRotation,
         tagAffinities = tagAffinities,
+        timeBucketCounts =
+            timeBucketCounts
+                .mapNotNull { (name, count) ->
+                    TimeBucket.entries.firstOrNull { it.name == name }?.let { it to count }
+                }.toMap(),
+        channelMemory =
+            ChannelMemoryState(
+                entries =
+                    channelMemory.mapValues { (_, entry) ->
+                        ChannelMemoryEntry(
+                            name = entry.name,
+                            lastFetchedAt = entry.lastFetchedAt,
+                            uploads =
+                                entry.uploads.map {
+                                    RememberedUpload(
+                                        it.videoId,
+                                        it.title,
+                                        it.thumbnailUrl,
+                                        it.durationSec,
+                                        it.publishedAt,
+                                        it.uploadDate,
+                                        it.viewCount,
+                                    )
+                                },
+                            rejectedAt = entry.rejectedAt,
+                            forgottenAt = entry.forgottenAt,
+                        )
+                    },
+                clearedAt = channelMemoryClearedAt,
+            ),
+        interestChips = InterestChipSet(interestChipMasses, interestChipsComputedAt),
+        displayForms = displayForms,
+        formatAffinity = formatAffinity,
+        categoryAffinity = categoryAffinity,
+        languageProfile = languageProfile,
+        languageVotes = languageVotes,
+        keyLanguage = keyLanguage,
         schemaVersion = schemaVersion,
     )
 }

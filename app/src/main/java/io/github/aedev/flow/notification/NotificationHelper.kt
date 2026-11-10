@@ -13,17 +13,22 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import coil3.SingletonImageLoader
+import coil3.request.CachePolicy
 import coil3.request.ImageRequest
 import coil3.request.SuccessResult
 import coil3.request.allowHardware
 import coil3.size.Precision
 import coil3.size.Scale
 import coil3.toBitmap
+import io.github.aedev.flow.BuildConfig
 import io.github.aedev.flow.MainActivity
 import io.github.aedev.flow.R
 import io.github.aedev.flow.data.local.AppDatabase
 import io.github.aedev.flow.data.local.PlayerPreferences
+import io.github.aedev.flow.data.local.ThumbnailQuality
 import io.github.aedev.flow.data.local.entity.NotificationEntity
+import io.github.aedev.flow.data.profile.ActiveProfile
+import io.github.aedev.flow.data.update.AppRelease
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -43,7 +48,40 @@ object NotificationHelper {
     const val CHANNEL_GENERAL = "general_channel"
     const val CHANNEL_REMINDERS = "reminders_channel"
     const val CHANNEL_UPDATES = "updates_channel"
+    const val CHANNEL_NEW_VERSION = "new_version_channel"
+    const val EXTRA_OPEN_UPDATE = "io.github.aedev.flow.extra.OPEN_UPDATE"
+    const val EXTRA_OPEN_LINKED = "io.github.aedev.flow.extra.OPEN_LINKED"
+    private const val NOTIFICATION_JOIN_REQUEST = 9998
     const val CHANNEL_IMPORTS = "imports_channel"
+
+    /** On every notification that belongs to one profile, so a tap left over from before a switch opens nothing of it. */
+    const val EXTRA_PROFILE_ID = "io.github.aedev.flow.extra.PROFILE_ID"
+
+    /** Channels whose notifications show one profile's content; a switch clears them. */
+    private val ProfileChannels =
+        setOf(CHANNEL_SUBSCRIPTIONS, CHANNEL_REMINDERS, CHANNEL_GENERAL, CHANNEL_IMPORTS, AutoBackupWorker.NOTIFICATION_CHANNEL_ID)
+
+    private fun profileIntent(context: Context): Intent =
+        Intent(context, MainActivity::class.java).putExtra(EXTRA_PROFILE_ID, ActiveProfile.get(context).id)
+
+    /** Clears the running profile's notifications before a switch; downloads and updates stay. */
+    fun cancelProfileNotifications(context: Context) {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        manager.activeNotifications
+            .filter { it.notification.channelId in ProfileChannels }
+            .forEach { manager.cancel(it.tag, it.id) }
+    }
+
+    /** False for a notification of another profile, still in the shade from before a switch. */
+    fun opensInRunningProfile(
+        context: Context,
+        intent: Intent,
+    ): Boolean = opensIn(intent.getStringExtra(EXTRA_PROFILE_ID), ActiveProfile.get(context).id)
+
+    internal fun opensIn(
+        stamped: String?,
+        runningId: String,
+    ): Boolean = stamped == null || stamped == runningId
 
     // Notification IDs
     const val NOTIFICATION_DOWNLOAD_PROGRESS = 1001
@@ -71,7 +109,7 @@ object NotificationHelper {
     ) {
         withContext(Dispatchers.IO) {
             try {
-                val db = AppDatabase.getDatabase(context)
+                val db = AppDatabase.profile(context)
                 db.notificationDao().insertNotification(entity)
             } catch (e: Exception) {
                 android.util.Log.e("NotificationHelper", "Failed to store notification", e)
@@ -172,6 +210,19 @@ object NotificationHelper {
                     description = context.getString(R.string.notification_channel_updates_description)
                     setShowBadge(true)
                 }
+
+            if (newVersionChannel(BuildConfig.UPDATE_CHANNEL, updatesChannelBlocked = false) == CHANNEL_NEW_VERSION) {
+                notificationManager.createNotificationChannel(
+                    NotificationChannel(
+                        CHANNEL_NEW_VERSION,
+                        context.getString(R.string.notification_channel_new_version),
+                        NotificationManager.IMPORTANCE_DEFAULT,
+                    ).apply {
+                        description = context.getString(R.string.notification_channel_new_version_description)
+                        setShowBadge(true)
+                    },
+                )
+            }
 
             val importsChannel =
                 NotificationChannel(
@@ -483,7 +534,7 @@ object NotificationHelper {
         videos.forEach { v ->
             val notifId = NOTIFICATION_NEW_VIDEO + v.videoId.hashCode().and(0xFFFF)
             val watchIntent =
-                Intent(context, MainActivity::class.java).apply {
+                profileIntent(context).apply {
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
                     putExtra("notification_video_id", v.videoId)
                     putExtra("video_id", v.videoId)
@@ -508,7 +559,7 @@ object NotificationHelper {
                     .setCategory(NotificationCompat.CATEGORY_SOCIAL)
                     .setGroup(GROUP_NEW_VIDEOS)
             v.thumbnailUrl?.let { url ->
-                getBitmapFromUrl(context, url)?.let { bm ->
+                getBitmapFromUrl(context, url, followThumbnailSetting = true)?.let { bm ->
                     builder.setLargeIcon(bm)
                     builder.setStyle(
                         NotificationCompat.BigPictureStyle().bigPicture(bm).bigLargeIcon(null as Bitmap?),
@@ -521,7 +572,7 @@ object NotificationHelper {
         if (!multiple) return
 
         val summaryIntent =
-            Intent(context, MainActivity::class.java).apply {
+            profileIntent(context).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             }
         val summaryPendingIntent =
@@ -604,7 +655,7 @@ object NotificationHelper {
 
         // Intent to open the video
         val watchIntent =
-            Intent(context, MainActivity::class.java).apply {
+            profileIntent(context).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
                 putExtra("notification_video_id", videoId)
                 putExtra("video_id", videoId)
@@ -632,7 +683,7 @@ object NotificationHelper {
 
         // Try to load thumbnail
         thumbnailUrl?.let { url ->
-            val bitmap = getBitmapFromUrl(context, url)
+            val bitmap = getBitmapFromUrl(context, url, followThumbnailSetting = true)
             bitmap?.let {
                 builder.setLargeIcon(it)
                 builder.setStyle(
@@ -684,9 +735,7 @@ object NotificationHelper {
      */
     fun showUpdateNotification(
         context: Context,
-        version: String,
-        changelog: String,
-        downloadUrl: String,
+        release: AppRelease,
     ) {
         if (!hasNotificationPermission(context)) return
         if (!runBlocking { PlayerPreferences(context).notifUpdatesEnabled.first() }) return
@@ -694,9 +743,7 @@ object NotificationHelper {
         val intent =
             Intent(context, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                putExtra("EXTRA_UPDATE_VERSION", version)
-                putExtra("EXTRA_UPDATE_CHANGELOG", changelog)
-                putExtra("EXTRA_UPDATE_URL", downloadUrl)
+                putExtra(EXTRA_OPEN_UPDATE, true)
             }
 
         val pendingIntent =
@@ -709,17 +756,55 @@ object NotificationHelper {
 
         val notification =
             NotificationCompat
-                .Builder(context, CHANNEL_UPDATES)
+                .Builder(context, newVersionChannel(context))
                 .setSmallIcon(R.drawable.ic_notification_logo)
-                .setContentTitle(context.getString(R.string.notification_update_available, version))
+                .setContentTitle(context.getString(R.string.notification_update_available, release.version))
                 .setContentText(context.getString(R.string.notification_tap_to_update))
                 .setContentIntent(pendingIntent)
                 .setAutoCancel(true)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
                 .setCategory(NotificationCompat.CATEGORY_STATUS)
                 .build()
 
         NotificationManagerCompat.from(context).notify(9999, notification)
+    }
+
+    private fun newVersionChannel(context: Context): String {
+        val manager = NotificationManagerCompat.from(context)
+        val updatesBlocked = manager.getNotificationChannel(CHANNEL_UPDATES)?.importance == NotificationManager.IMPORTANCE_NONE
+        return newVersionChannel(BuildConfig.UPDATE_CHANNEL, updatesBlocked)
+    }
+
+    /** A device asked to join this device's linked group with the admin token; the tap opens Linked devices. */
+    fun showJoinRequest(
+        context: Context,
+        name: String,
+    ) {
+        if (!hasNotificationPermission(context)) return
+        val intent =
+            profileIntent(context).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra(EXTRA_OPEN_LINKED, true)
+            }
+        val pendingIntent =
+            PendingIntent.getActivity(
+                context,
+                NOTIFICATION_JOIN_REQUEST,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+        val text = context.getString(R.string.linked_join_notification_text, name)
+        val notification =
+            NotificationCompat
+                .Builder(context, CHANNEL_GENERAL)
+                .setSmallIcon(R.drawable.ic_notification_logo)
+                .setContentTitle(context.getString(R.string.linked_join_notification_title))
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+        NotificationManagerCompat.from(context).notify(NOTIFICATION_JOIN_REQUEST, notification)
     }
 
     // ========== GENERAL NOTIFICATIONS ==========
@@ -737,7 +822,7 @@ object NotificationHelper {
         if (!runBlocking { PlayerPreferences(context).notifGeneralEnabled.first() }) return
 
         val intent =
-            Intent(context, MainActivity::class.java).apply {
+            profileIntent(context).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             }
         val pendingIntent =
@@ -777,7 +862,7 @@ object NotificationHelper {
         val notificationId = NOTIFICATION_GENERAL + videoId.hashCode().and(0xFFF)
 
         val watchIntent =
-            Intent(context, MainActivity::class.java).apply {
+            profileIntent(context).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
                 putExtra("video_id", videoId)
             }
@@ -827,8 +912,8 @@ object NotificationHelper {
         if (!runBlocking { PlayerPreferences(context).notifRemindersEnabled.first() }) return
 
         val intent =
-            Intent(context, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            profileIntent(context).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
             }
 
         val pendingIntent =
@@ -870,9 +955,10 @@ object NotificationHelper {
         if (!runBlocking { PlayerPreferences(context).notifRemindersEnabled.first() }) return
 
         val intent =
-            Intent(context, MainActivity::class.java).apply {
+            profileIntent(context).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                putExtra("open_video_id", videoId)
+                putExtra("notification_video_id", videoId)
+                putExtra("video_id", videoId)
             }
 
         val pendingIntent =
@@ -896,7 +982,7 @@ object NotificationHelper {
                 .setAutoCancel(true)
 
         runBlocking {
-            val bitmap = thumbnailUrl?.let { getBitmapFromUrl(context, it) }
+            val bitmap = thumbnailUrl?.let { getBitmapFromUrl(context, it, followThumbnailSetting = true) }
             if (bitmap != null) {
                 builder.setLargeIcon(bitmap)
             }
@@ -925,15 +1011,19 @@ object NotificationHelper {
      * cache the feed already populated instead of refetching through a second image stack.
      * Hardware bitmaps are disabled because notification bitmaps must be parcelable to
      * SystemUI, and INEXACT precision keeps the "never upscale" behaviour of the previous
-     * centerInside/onlyScaleDown request.
+     * centerInside/onlyScaleDown request. With [followThumbnailSetting], a viewer who turned
+     * thumbnails off gets one only if it is already cached.
      */
     suspend fun getBitmapFromUrl(
         context: Context,
         url: String,
+        followThumbnailSetting: Boolean = false,
     ): Bitmap? =
         withContext(Dispatchers.IO) {
             try {
                 if (url.isEmpty()) return@withContext null
+                val cacheOnly =
+                    followThumbnailSetting && PlayerPreferences(context).currentThumbnailQuality() == ThumbnailQuality.OFF
                 val request =
                     ImageRequest
                         .Builder(context)
@@ -942,6 +1032,7 @@ object NotificationHelper {
                         .scale(Scale.FIT)
                         .precision(Precision.INEXACT)
                         .allowHardware(false)
+                        .apply { if (cacheOnly) networkCachePolicy(CachePolicy.DISABLED) }
                         .build()
                 (SingletonImageLoader.get(context).execute(request) as? SuccessResult)
                     ?.image

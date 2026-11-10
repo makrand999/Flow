@@ -1,7 +1,7 @@
 /*
  * Copyright (C) 2025-2026 Flow | A-EDev
  *
- * This file is part of Flow (https://github.com/A-EDev/Flow).
+ * This file is part of Flow (https://github.com/Flow-Tube/Flow).
  * Test-source-set only — never shipped in the APK.
  */
 
@@ -9,6 +9,7 @@ package io.github.aedev.flow.data.recommendation.eval
 
 import io.github.aedev.flow.data.recommendation.ContentVector
 import io.github.aedev.flow.data.recommendation.FeedEntry
+import io.github.aedev.flow.data.recommendation.FeedImpressionLedger
 import io.github.aedev.flow.data.recommendation.FlowPersona
 import io.github.aedev.flow.data.recommendation.NeuroDiscovery
 import io.github.aedev.flow.data.recommendation.NeuroScoring
@@ -343,8 +344,9 @@ internal object NeuroBenchmark {
             servedSoFar += feedIds
             impressedSoFar += feedIds.take(viewportK)
 
-            // 5. Feedback: viewport impressions + one watch from a strong interest.
-            feedIds.take(viewportK).forEach { id ->
+            // 5. Feedback: viewport impressions, counted as the engine counts them, + one watch from a
+            // strong interest.
+            FeedImpressionLedger.countable(feedIds.take(viewportK), feedHistory, now).forEach { id ->
                 val prev = feedHistory[id]
                 feedHistory[id] = FeedEntry(lastShown = now, showCount = (prev?.showCount ?: 0) + 1)
             }

@@ -179,6 +179,10 @@ object VideoCodecUtils {
             ?: 0
     }
 
+    /** YouTube names an HDR format in its label ("2160p60 HDR") and never an SDR one. */
+    fun isHdr(stream: VideoStream): Boolean =
+        listOfNotNull(stream.resolution, stream.itagItem?.resolutionString).any { it.contains("HDR", ignoreCase = true) }
+
     fun frameRateFromLabel(label: String?): Int? {
         if (label.isNullOrBlank()) return null
         return FRAME_RATE_LABEL_REGEX
@@ -196,11 +200,6 @@ object VideoCodecUtils {
         height: Int,
         fps: Int,
     ): String = if (fps >= HIGH_FRAME_RATE_FPS) "${height}p$fps" else "${height}p"
-
-    fun qualityLabelFromStream(stream: VideoStream): String =
-        stream.resolution
-            .takeIf { it.isNotBlank() && it != VideoStream.RESOLUTION_UNKNOWN }
-            ?: "${qualityHeightFromStream(stream)}p"
 
     fun playbackCodecRank(stream: VideoStream): Int = playbackCodecRank(codecKeyFromStream(stream))
 
@@ -304,4 +303,10 @@ object VideoCodecUtils {
             rawHeight in setOf(2160, 1440, 1080, 720, 480, 360, 240, 144) -> rawHeight
             else -> rawHeight
         }
+
+    /** A frame's quality class is its short side: a portrait 720x1280 frame is 720p, not 1280p. */
+    fun qualityClass(
+        width: Int,
+        height: Int,
+    ): Int = if (width > 0 && height > 0) minOf(width, height) else maxOf(width, height, 0)
 }

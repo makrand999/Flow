@@ -12,8 +12,8 @@ class VideoSurfacePolicyTest {
             VideoSurfacePolicy.canRestoreVideoOutput(
                 sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
                 isDisplayInteractive = true,
-                isSurfaceValid = false
-            )
+                isSurfaceValid = false,
+            ),
         ).isFalse()
     }
 
@@ -23,8 +23,8 @@ class VideoSurfacePolicyTest {
             VideoSurfacePolicy.canRestoreVideoOutput(
                 sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
                 isDisplayInteractive = true,
-                isSurfaceValid = true
-            )
+                isSurfaceValid = true,
+            ),
         ).isTrue()
     }
 
@@ -34,8 +34,8 @@ class VideoSurfacePolicyTest {
             VideoSurfacePolicy.canRestoreVideoOutput(
                 sdkInt = Build.VERSION_CODES.TIRAMISU,
                 isDisplayInteractive = true,
-                isSurfaceValid = false
-            )
+                isSurfaceValid = false,
+            ),
         ).isTrue()
     }
 
@@ -45,8 +45,8 @@ class VideoSurfacePolicyTest {
             VideoSurfacePolicy.canRestoreVideoOutput(
                 sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
                 isDisplayInteractive = false,
-                isSurfaceValid = true
-            )
+                isSurfaceValid = true,
+            ),
         ).isFalse()
     }
 
@@ -56,8 +56,8 @@ class VideoSurfacePolicyTest {
             VideoSurfacePolicy.shouldResyncOnSurfaceReattach(
                 playWhenReady = false,
                 isLive = false,
-                playbackState = Player.STATE_READY
-            )
+                playbackState = Player.STATE_READY,
+            ),
         ).isTrue()
     }
 
@@ -67,8 +67,8 @@ class VideoSurfacePolicyTest {
             VideoSurfacePolicy.shouldResyncOnSurfaceReattach(
                 playWhenReady = false,
                 isLive = false,
-                playbackState = Player.STATE_BUFFERING
-            )
+                playbackState = Player.STATE_BUFFERING,
+            ),
         ).isTrue()
     }
 
@@ -78,8 +78,8 @@ class VideoSurfacePolicyTest {
             VideoSurfacePolicy.shouldResyncOnSurfaceReattach(
                 playWhenReady = true,
                 isLive = false,
-                playbackState = Player.STATE_READY
-            )
+                playbackState = Player.STATE_READY,
+            ),
         ).isFalse()
     }
 
@@ -89,8 +89,8 @@ class VideoSurfacePolicyTest {
             VideoSurfacePolicy.shouldResyncOnSurfaceReattach(
                 playWhenReady = false,
                 isLive = true,
-                playbackState = Player.STATE_READY
-            )
+                playbackState = Player.STATE_READY,
+            ),
         ).isFalse()
     }
 
@@ -100,15 +100,59 @@ class VideoSurfacePolicyTest {
             VideoSurfacePolicy.shouldResyncOnSurfaceReattach(
                 playWhenReady = false,
                 isLive = false,
-                playbackState = Player.STATE_IDLE
-            )
+                playbackState = Player.STATE_IDLE,
+            ),
         ).isFalse()
         assertThat(
             VideoSurfacePolicy.shouldResyncOnSurfaceReattach(
                 playWhenReady = false,
                 isLive = false,
-                playbackState = Player.STATE_ENDED
-            )
+                playbackState = Player.STATE_ENDED,
+            ),
         ).isFalse()
+    }
+
+    @Test
+    fun `the resync target never lands on the position the player already reports`() {
+        // A seek resolving to the current millisecond returns before the renderers are disabled,
+        // so the target has to differ by at least one.
+        assertThat(VideoSurfacePolicy.resyncSeekTargetMs(315066L)).isEqualTo(315065L)
+        assertThat(VideoSurfacePolicy.resyncSeekTargetMs(1L)).isEqualTo(0L)
+    }
+
+    @Test
+    fun `a player at the very start nudges forward instead of below zero`() {
+        assertThat(VideoSurfacePolicy.resyncSeekTargetMs(0L)).isEqualTo(1L)
+    }
+
+    @Test
+    fun `a surface that came back on a running video is watched for a stuck first frame`() {
+        assertThat(
+            VideoSurfacePolicy.shouldWatchFirstFrame(
+                wasSurfaceValid = false,
+                reenabledVideo = false,
+                isAudioOnly = false,
+                isLive = false,
+            ),
+        ).isTrue()
+    }
+
+    @Test
+    fun `turning video back on after audio only is left to join without a flush`() {
+        assertThat(
+            VideoSurfacePolicy.shouldWatchFirstFrame(
+                wasSurfaceValid = false,
+                reenabledVideo = true,
+                isAudioOnly = false,
+                isLive = false,
+            ),
+        ).isFalse()
+    }
+
+    @Test
+    fun `audio only, live and an unchanged surface are never watched`() {
+        assertThat(VideoSurfacePolicy.shouldWatchFirstFrame(false, false, isAudioOnly = true, isLive = false)).isFalse()
+        assertThat(VideoSurfacePolicy.shouldWatchFirstFrame(false, false, isAudioOnly = false, isLive = true)).isFalse()
+        assertThat(VideoSurfacePolicy.shouldWatchFirstFrame(true, false, isAudioOnly = false, isLive = false)).isFalse()
     }
 }

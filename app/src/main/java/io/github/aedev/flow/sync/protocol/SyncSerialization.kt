@@ -3,12 +3,12 @@ package io.github.aedev.flow.sync.protocol
 import io.github.aedev.flow.sync.canonical.CanonicalBrain
 import io.github.aedev.flow.sync.canonical.CanonicalLike
 import io.github.aedev.flow.sync.canonical.CanonicalMusicBrain
+import io.github.aedev.flow.sync.canonical.CanonicalNote
 import io.github.aedev.flow.sync.canonical.CanonicalPlaylist
 import io.github.aedev.flow.sync.canonical.CanonicalSetting
 import io.github.aedev.flow.sync.canonical.CanonicalSubscribedChannel
 import io.github.aedev.flow.sync.canonical.CanonicalSubscriptionGroup
 import io.github.aedev.flow.sync.canonical.CanonicalWatchHistory
-import io.github.aedev.flow.sync.merge.BrainMerger
 import io.github.aedev.flow.sync.merge.MusicBrainMerger
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
@@ -77,11 +77,13 @@ object SyncSerialization {
             }
         }
 
-    /** Encode one record as compact, sorted-key canonical JSON. */
+    /** Compact, sorted-key canonical JSON, shared by FLOW-SYNC/1 records and FLOW-SYNC/2 messages. */
+    fun canonicalJson(element: JsonElement): String = json.encodeToString(JsonElement.serializer(), canonicalize(element))
+
     private fun <T> enc(
         serializer: KSerializer<T>,
         value: T,
-    ): String = json.encodeToString(JsonElement.serializer(), canonicalize(json.encodeToJsonElement(serializer, value)))
+    ): String = canonicalJson(json.encodeToJsonElement(serializer, value))
 
     private fun <T> wire(
         records: List<T>,
@@ -129,11 +131,38 @@ object SyncSerialization {
     fun decodeSubscriptions(lines: List<String>): List<CanonicalSubscriptionGroup> =
         lines.filter { it.isNotBlank() }.map { json.decodeFromString(CanonicalSubscriptionGroup.serializer(), it) }
 
-    // --- brain ---
-    fun encodeBrain(brain: CanonicalBrain): CollectionWire {
-        val line = enc(CanonicalBrain.serializer(), brain)
-        return CollectionWire(listOf(line), 1, sha256Hex(line))
+    // --- notes ---
+    fun encodeNotes(records: List<CanonicalNote>) = wire(records.sortedBy { it.id }, CanonicalNote.serializer())
+
+    fun decodeNotes(lines: List<String>): List<CanonicalNote> =
+        lines.filter { it.isNotBlank() }.map { json.decodeFromString(CanonicalNote.serializer(), it) }
+
+    private val recordSerializers: Map<String, KSerializer<*>> =
+        mapOf(
+            SyncCollection.WATCH_HISTORY to CanonicalWatchHistory.serializer(),
+            SyncCollection.PLAYLISTS to CanonicalPlaylist.serializer(),
+            SyncCollection.LIKES to CanonicalLike.serializer(),
+            SyncCollection.SETTINGS to CanonicalSetting.serializer(),
+            SyncCollection.SUBSCRIBED_CHANNELS to CanonicalSubscribedChannel.serializer(),
+            SyncCollection.SUBSCRIPTIONS to CanonicalSubscriptionGroup.serializer(),
+            SyncCollection.NOTES to CanonicalNote.serializer(),
+            SyncCollection.FLOW_NEURO_BRAIN to CanonicalBrain.serializer(),
+            SyncCollection.MUSIC_BRAIN to CanonicalMusicBrain.serializer(),
+        )
+
+    /** Decodes each record of a known [collection] as the merges will, throwing on one they can't read. */
+    fun checkRecords(
+        collection: String,
+        lines: List<String>,
+    ) {
+        val serializer = recordSerializers[collection] ?: return
+        lines.filter { it.isNotBlank() }.forEach { json.decodeFromString(serializer, it) }
     }
+
+    // --- brain ---
+
+    /** One line per device snapshot, the sender's own carrying the shared CRDT state. */
+    fun encodeBrain(snapshots: List<CanonicalBrain>) = wire(snapshots.sortedBy { it.deviceId }, CanonicalBrain.serializer())
 
     // --- music brain ---
     fun encodeMusicBrain(brain: CanonicalMusicBrain): CollectionWire {
@@ -149,13 +178,12 @@ object SyncSerialization {
             .reduceOrNull(MusicBrainMerger::merge)
 
     /**
-     * Fold **every** record, not just the first: the desktop ships one snapshot per device it knows
-     * about (`brainmap::merged_flow_to_snapshots`) so a third device converges transitively. Taking
-     * only the first silently discarded every other device's learned vectors.
+     * Every record, kept apart: the desktop ships one snapshot per device it knows about
+     * (`brainmap::merged_flow_to_snapshots`), and the learned vectors are a weighted mean over those
+     * devices, which a fold into one record would lose.
      */
-    fun decodeBrain(lines: List<String>): CanonicalBrain? =
+    fun decodeBrainSnapshots(lines: List<String>): List<CanonicalBrain> =
         lines
             .filter { it.isNotBlank() }
             .map { json.decodeFromString(CanonicalBrain.serializer(), it) }
-            .reduceOrNull(BrainMerger::merge)
 }
