@@ -1,0 +1,338 @@
+package io.github.aedev.flow.sync2.service
+
+import android.content.Context
+import android.util.Log
+import dagger.hilt.android.qualifiers.ApplicationContext
+import io.github.aedev.flow.notification.NotificationHelper
+import io.github.aedev.flow.sync.apply.PeerInfo
+import io.github.aedev.flow.sync.apply.SyncApplier
+import io.github.aedev.flow.sync.crypto.SyncBytes
+import io.github.aedev.flow.sync.identity.DeviceIdentity
+import io.github.aedev.flow.sync.protocol.CollectionWire
+import io.github.aedev.flow.sync.protocol.SyncCollection
+import io.github.aedev.flow.sync2.changes.COLLECTION_TABLES
+import io.github.aedev.flow.sync2.changes.IncomingBatch
+import io.github.aedev.flow.sync2.changes.TableChanges
+import io.github.aedev.flow.sync2.changes.applyBatches
+import io.github.aedev.flow.sync2.changes.collectionsToPush
+import io.github.aedev.flow.sync2.crypto.MemberSecrets
+import io.github.aedev.flow.sync2.data.GroupRecord
+import io.github.aedev.flow.sync2.data.KeptBatches
+import io.github.aedev.flow.sync2.data.LinkedDatabase
+import io.github.aedev.flow.sync2.data.ProfileLinkRow
+import io.github.aedev.flow.sync2.data.serverUrl
+import io.github.aedev.flow.sync2.data.webDavUrl
+import io.github.aedev.flow.sync2.device.DeviceKeys
+import io.github.aedev.flow.sync2.device.StoreCredentials
+import io.github.aedev.flow.sync2.device.WebDavLogin
+import io.github.aedev.flow.sync2.engine.LinkedException
+import io.github.aedev.flow.sync2.engine.Session
+import io.github.aedev.flow.sync2.engine.collectGarbage
+import io.github.aedev.flow.sync2.engine.isDue
+import io.github.aedev.flow.sync2.engine.writeSnapshot
+import io.github.aedev.flow.sync2.linking.DeviceMeta
+import io.github.aedev.flow.sync2.linking.deviceNames
+import io.github.aedev.flow.sync2.linking.finishRestore
+import io.github.aedev.flow.sync2.linking.rotateEpoch
+import io.github.aedev.flow.sync2.store.FileLayout
+import io.github.aedev.flow.sync2.store.GroupStore
+import io.github.aedev.flow.sync2.store.LocalStore
+import io.github.aedev.flow.sync2.store.Remote
+import io.github.aedev.flow.sync2.store.ServerStore
+import io.github.aedev.flow.sync2.store.StoreException
+import io.github.aedev.flow.sync2.store.StoreLogin
+import io.github.aedev.flow.sync2.store.WebDavStore
+import io.github.aedev.flow.sync2.store.checkFolder
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/** When the last sync ran, and why it failed if it did. */
+data class LastSync(
+    val atMs: Long,
+    val error: LinkedError?,
+)
+
+/** What one sync applied from one device. */
+data class Received(
+    val from: String,
+    val changes: Int,
+)
+
+/**
+ * One sync of this device's group, for the worker and for Sync now, one at a time. It runs in every
+ * profile; only the linked profile's data is sent and applied.
+ */
+@Singleton
+class LinkedSync
+    @Inject
+    constructor(
+        @ApplicationContext private val context: Context,
+        private val db: LinkedDatabase,
+        private val keys: DeviceKeys,
+        private val applier: SyncApplier,
+        private val identity: DeviceIdentity,
+        private val local: LocalStore,
+        private val indicator: SyncIndicator,
+        private val reset: LinkedReset,
+        private val credentials: StoreCredentials,
+        private val tables: TableChanges,
+        private val profiles: LinkedProfiles,
+        private val kept: KeptBatches,
+    ) {
+        private val running = Mutex()
+        private val last = MutableStateFlow<LastSync?>(null)
+        private val active = MutableStateFlow(false)
+        private val arrivals = MutableSharedFlow<Received>(extraBufferCapacity = 16)
+
+        val lastSync: StateFlow<LastSync?> = last.asStateFlow()
+
+        /** New recovery words a restore's removal had to make, to show once. */
+        val replacedWords = MutableStateFlow<String?>(null)
+
+        val syncing: StateFlow<Boolean> = active.asStateFlow()
+
+        /** Each device a sync the user asked for applied changes from. */
+        val received: SharedFlow<Received> = arrivals.asSharedFlow()
+
+        /** The group's Flow server, or null for a group that lives on its devices alone. */
+        fun server(
+            record: GroupRecord,
+            device: MemberSecrets,
+        ): ServerStore? = record.serverUrl?.let { ServerStore.connect(it, device, record.instance, record.groupId) }
+
+        /** The group's shared store: its Flow server or WebDAV folder, or null for a group on its devices alone. */
+        suspend fun remote(
+            record: GroupRecord,
+            device: MemberSecrets,
+        ): Remote? {
+            val folder = record.webDavUrl ?: return server(record, device)
+            val login = credentials.webDav()?.takeIf { !it.refused } ?: throw StoreException.LoginRefused()
+            return FileLayout(WebDavStore.connect(folder, login.user, login.password, login.conditional), SyncBytes.toHex(device.did))
+        }
+
+        suspend fun groupStore(
+            record: GroupRecord,
+            device: MemberSecrets,
+        ): GroupStore = GroupStore(local, remote(record, device))
+
+        /** A session on what this device holds, after copying the server's roster and keys. */
+        suspend fun open(
+            record: GroupRecord,
+            device: MemberSecrets,
+        ): Session {
+            val store = groupStore(record, device)
+            store.download(SyncBytes.toHex(device.did), record.serverCursor, objects = false)
+            return Session.open(db, store, device)
+        }
+
+        /**
+         * Whether the folder takes [login] and still holds the group. If so it replaces the saved one, whatever
+         * was pending, and the change this device had under way.
+         */
+        suspend fun adoptLogin(login: StoreLogin): Boolean {
+            val record = db.groups().group() ?: return false
+            val folder = record.webDavUrl ?: return false
+            val conditional = checkFolder(WebDavStore.connect(folder, login.user, login.password), record.groupId) ?: return false
+            credentials.save(WebDavLogin(login.user, login.password, conditional))
+            credentials.forgetPending()
+            db.groups().forgetLoginChange()
+            return true
+        }
+
+        /** The folder refused the login: tries the pending one once, and otherwise nothing more is sent until the user enters one. */
+        private suspend fun onLoginRefused() {
+            val login = credentials.webDav() ?: return
+            if (login.refused) return
+            val adopted = credentials.pending()?.let { pending -> runCatching { adoptLogin(pending) }.getOrDefault(false) } ?: false
+            if (adopted) LinkedSyncWorker.syncSoon(context) else credentials.save(login.copy(refused = true))
+        }
+
+        /** [announce]: say what arrived, for a sync the user asked for; the others stay silent. */
+        suspend fun syncNow(announce: Boolean = false): LastSync =
+            running.withLock {
+                active.value = true
+                // A cancelled sync is not a failed one: it stops, and the next run picks up where it left off.
+                val error =
+                    try {
+                        withContext(Dispatchers.Default) { run(announce) }
+                        null
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // Out of the group: a verified roster drops this device, or its server refuses it a token.
+                        // Nothing more goes to a WebDAV server that refused the login until the user enters it again.
+                        when (e) {
+                            is LinkedException.Removed -> reset.removed()
+                            is LinkedException.RemovalUnconfirmed -> LinkedSyncWorker.cancel(context)
+                            is StoreException.SignInRefused -> LinkedSyncWorker.cancel(context)
+                            is StoreException.LoginRefused -> onLoginRefused()
+                        }
+                        e.linkedError()
+                    } finally {
+                        active.value = false
+                        indicator.hide()
+                    }
+                error?.let { Log.w(TAG, "Linked-devices sync failed: $it") }
+                LastSync(System.currentTimeMillis(), error).also { last.value = it }
+            }
+
+        private suspend fun export(collections: List<String> = SyncCollection.ANDROID_SYNCABLE): Map<String, CollectionWire> =
+            applier.exportPayload(collections, identity.hlcNode(), identity.newClock().now().encode())
+
+        /**
+         * Uploads what changed in [link] here, exporting only the collections that can have changed: exporting
+         * the whole library on every sync held tens of megabytes at once, several times a minute
+         * while another device played.
+         */
+        private suspend fun push(
+            session: Session,
+            link: String,
+        ): Int {
+            val lastSent = db.sent().lastSent(link).associate { it.collection to it.sentAt }
+            val collections = collectionsToPush(SyncCollection.ANDROID_SYNCABLE, tables.unchanged(), lastSent, System.currentTimeMillis())
+            val tracked = collections.filter { it in COLLECTION_TABLES }
+            tables.exporting(tracked)
+            return try {
+                session.push(export(collections), link)
+            } catch (e: Throwable) {
+                tables.failed(tracked)
+                throw e
+            }
+        }
+
+        private suspend fun run(announce: Boolean) {
+            if (reset.leaveFailed.value != null) return
+            val record = db.groups().group() ?: return
+            val device = keys.load()
+            val me = SyncBytes.toHex(device.did)
+            val store = groupStore(record, device)
+            // Without the server, what LAN peers brought is still merged; the server's part waits for the next run.
+            val offline =
+                try {
+                    db.groups().setServerCursor(store.download(me, record.serverCursor, objects = true))
+                    null
+                } catch (e: StoreException.Network) {
+                    e
+                }
+            val reading = if (offline == null) store else GroupStore(local, null)
+            var session = Session.open(db, reading, device)
+            if (session.removalPending) {
+                // It needs the store to take the removal; what it read stays for this sync once that's done.
+                if (offline != null) throw offline
+                // A read that isn't finished doesn't remove: the next sync goes on from what it holds (spec/protocol.md, Recovery, step 6).
+                if (store.cutShort) throw LinkedException.RestoreUnfinished()
+                session =
+                    finishRestore(session, device, { replacedWords.value = it }) {
+                        store.download(me, record.serverCursor, objects = false)
+                        Session.open(db, reading, device)
+                    }
+                if (session.removalPending) return
+            }
+            val links = profiles.links(session) ?: return
+            // A device left: start the epoch it never receives before writing anything, then read the roster back (spec/protocol.md, Leaving).
+            if (session.state.rotate && !session.state.recoveryDue && offline == null) {
+                if (rotateEpoch(session, device)) db.snapshots().snapshotSoon()
+                store.download(me, record.serverCursor, objects = false)
+                session = Session.open(db, reading, device)
+            }
+            exchange(session, links, announce)
+            if (offline != null) throw offline
+            session.collectGarbage(links.mapTo(HashSet<String?>()) { it.link } + null)
+            val uploaded = store.upload(me, db.groups().group()?.uploaded ?: 0)
+            db.groups().setUploaded(uploaded.cursor)
+            // The sync is done; a failed look for devices asking to join only waits for the next one.
+            try {
+                server(record, device)?.joinRequests()?.firstOrNull()?.let { NotificationHelper.showJoinRequest(context, it.name) }
+            } catch (_: StoreException) {
+            }
+            // Everything else in this sync is done; the user still has to hear that the device's changes aren't going out.
+            uploaded.refused?.let { throw it }
+        }
+
+        /**
+         * Sends the running profile's changes when it syncs, then reads the linked profiles' batches: the running
+         * profile's are applied, after what was kept for it, and the others' kept until their profile runs.
+         */
+        private suspend fun exchange(
+            session: Session,
+            links: List<ProfileLinkRow>,
+            announce: Boolean,
+        ) {
+            val active = profiles.activeLink()
+            var names: Map<String, DeviceMeta>? = null
+            val hlc = identity.newClock().now().encode()
+            val counts = mutableMapOf<String, Int>()
+            var merged = 0L
+            var named = 0L
+
+            suspend fun apply(
+                sender: String,
+                batches: List<IncomingBatch>,
+            ) {
+                val meta = (names ?: deviceNames(session).also { names = it })[sender]
+                applyBatches(db.sent(), checkNotNull(active), batches, System.currentTimeMillis(), ::export) { received ->
+                    applier.applyPayload(PeerInfo(sender, meta?.name.orEmpty(), meta?.platform.orEmpty()), received, hlc, onceEach = false)
+                    counts.merge(sender, received.values.sumOf { it.lines.size }, Int::plus)
+                }
+                merged += batches.sumOf { it.size.toLong() }
+            }
+
+            suspend fun route(read: Map<String, List<IncomingBatch>>) {
+                for ((sender, all) in read) {
+                    val (names, batches) = all.partition { it.link == null }
+                    profiles.merge(names)
+                    named += names.sumOf { it.size.toLong() }
+                    val (here, elsewhere) = batches.partition { it.link == active }
+                    elsewhere.forEach { kept.keep(checkNotNull(it.link), sender, it) }
+                    if (here.isNotEmpty()) apply(sender, here)
+                }
+            }
+
+            for (row in links.filterNot { it.caughtUp }) {
+                route(session.startReading(row.link) ?: continue)
+                db.profiles().caughtUp(row.link)
+            }
+            if (active != null) {
+                while (true) {
+                    val batch = kept.first(active) ?: break
+                    apply(batch.sender, listOf(batch.batch))
+                    kept.applied(batch)
+                }
+            }
+            val pushed = (if (active != null) push(session, active) else 0) + session.push(profiles.export(), null)
+            val pulled = session.pull(links.mapTo(HashSet<String?>()) { it.link } + null)
+            if (pushed > 0 || merged > 0 || pulled.batches.isNotEmpty()) indicator.show()
+            route(pulled.batches)
+            pulled.login?.let { credentials.savePending(it) }
+            session.finish(pulled)
+            if (announce) {
+                counts.filterValues { it > 0 }.forEach { (sender, changes) ->
+                    arrivals.tryEmit(Received(names?.get(sender)?.name.orEmpty(), changes))
+                }
+            }
+            val now = System.currentTimeMillis()
+            db.snapshots().noteMerged("", named, now)
+            if (db.snapshots().isDue("", now)) session.writeSnapshot(profiles.export(), null)
+            if (active == null) return
+            db.snapshots().noteMerged(active, merged, now)
+            if (db.snapshots().isDue(active, now) && holdsAll(active)) session.writeSnapshot(export(), active)
+        }
+
+        /** Whether everything this device read of [link] is merged: nothing kept for it, nothing left to catch up. */
+        private suspend fun holdsAll(link: String): Boolean = kept.count(link) == 0 && db.profiles().reads().none { it.link == link }
+
+        private companion object {
+            const val TAG = "LinkedSync"
+        }
+    }

@@ -3,6 +3,9 @@ package io.github.aedev.flow.sync
 import android.content.Context
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.aedev.flow.R
+import io.github.aedev.flow.data.profile.ProfileRepository
+import io.github.aedev.flow.data.profile.SyncProfile
+import io.github.aedev.flow.data.recommendation.NeuroKeySpec
 import io.github.aedev.flow.sync.apply.PeerInfo
 import io.github.aedev.flow.sync.apply.ReceivedCollection
 import io.github.aedev.flow.sync.apply.SyncApplier
@@ -26,18 +29,25 @@ import io.github.aedev.flow.sync.transport.SyncConnection
 import io.github.aedev.flow.sync.transport.SyncForegroundService
 import io.github.aedev.flow.sync.transport.WsClient
 import io.github.aedev.flow.sync.transport.WsServer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
+import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
+
+private const val MANUAL_SHARE_TTL_SECONDS = 600L
 
 /**
  * Owns one FLOW-SYNC/1 session end-to-end and exposes it as a single [StateFlow].
@@ -58,6 +68,7 @@ class SyncManager
         private val okHttpClient: OkHttpClient,
         private val deviceIdentity: DeviceIdentity,
         private val applier: SyncApplier,
+        private val profiles: ProfileRepository,
     ) {
         private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -71,6 +82,21 @@ class SyncManager
         private var directionalKeys: DirectionalKeys? = null
         private var sasDeferred: CompletableDeferred<Boolean>? = null
         private var consentDeferred: CompletableDeferred<Boolean>? = null
+        private var hostPairing: HostPairing? = null
+        private var foregroundToken: Long? = null
+
+        /** When the shown code lapses; the listener closes then, since scanners no longer check `exp`. */
+        @Volatile private var hostExpiresAtEpochSeconds = 0L
+
+        private class HostPairing(
+            val sessionId: ByteArray,
+            val masterKey: ByteArray,
+            val ip: String,
+            val port: Int,
+            val deviceName: String,
+            val role: String,
+            val sending: Boolean,
+        )
 
         // --- public API (called by the ViewModel) ---
 
@@ -80,19 +106,12 @@ class SyncManager
             collections: List<String>,
         ) {
             if (job?.isActive == true) return
-            job = scope.launch { runHost(role, collections, sessionBoundQr = false) }
-        }
-
-        /**
-         * Host a session for a TV QR. TV/emulator wall clocks are not guaranteed to agree with the
-         * phone scanner, so the live, single-use server session is the freshness boundary.
-         */
-        fun hostForTv(
-            role: SyncRole,
-            collections: List<String>,
-        ) {
-            if (job?.isActive == true) return
-            job = scope.launch { runHost(role, collections, sessionBoundQr = true) }
+            val previous = job
+            job =
+                scope.launch {
+                    previous?.cancelAndJoin()
+                    if (!refusedOutsideSyncProfile()) runHost(role, collections)
+                }
         }
 
         /** Become the client (scan a QR) in the given [role]. [collections] is only used when SENDER. */
@@ -102,7 +121,33 @@ class SyncManager
             collections: List<String>,
         ) {
             if (job?.isActive == true) return
-            job = scope.launch { runClient(role, qrText, collections) }
+            val previous = job
+            job =
+                scope.launch {
+                    previous?.cancelAndJoin()
+                    if (!refusedOutsideSyncProfile()) runClient(role, qrText, collections)
+                }
+        }
+
+        /** A session is pairing, transferring or merging. */
+        val isBusy: Boolean get() = job?.isActive == true
+
+        // The screen already says so; this keeps any other caller from syncing another profile's data.
+        private suspend fun refusedOutsideSyncProfile(): Boolean {
+            if (SyncProfile.syncsHere(context)) return false
+            val name = SyncProfile.name(profiles.state.first(), context)
+            _state.value = SyncState.Failed(context.getString(R.string.sync_default_only_title, name))
+            return true
+        }
+
+        fun extendPairingForManualShare(): String? {
+            val pairing = hostPairing ?: return null
+            if (_state.value !is SyncState.ShowingQr) return null
+            val exp = System.currentTimeMillis() / 1000 + MANUAL_SHARE_TTL_SECONDS
+            hostExpiresAtEpochSeconds = exp
+            val extended = showingQr(pairing, exp, MANUAL_SHARE_TTL_SECONDS)
+            _state.value = extended
+            return extended.qrText
         }
 
         fun confirmSas(matches: Boolean) {
@@ -125,10 +170,31 @@ class SyncManager
 
         // --- host (show QR); role may be SENDER or RECEIVER ---
 
+        private fun showingQr(
+            pairing: HostPairing,
+            expEpochSeconds: Long,
+            ttlSeconds: Long,
+        ): SyncState.ShowingQr =
+            SyncState.ShowingQr(
+                qrText =
+                    QrCodec.build(
+                        sessionId = pairing.sessionId,
+                        masterKey = pairing.masterKey,
+                        ip = pairing.ip,
+                        port = pairing.port,
+                        deviceName = pairing.deviceName,
+                        expEpochSeconds = expEpochSeconds,
+                        role = pairing.role,
+                    ),
+                expiresAtEpochSeconds = expEpochSeconds,
+                ttlSeconds = ttlSeconds,
+                sending = pairing.sending,
+                address = "${pairing.ip}:${pairing.port}",
+            )
+
         private suspend fun runHost(
             role: SyncRole,
             collections: List<String>,
-            sessionBoundQr: Boolean,
         ) {
             try {
                 _state.value = SyncState.Preparing
@@ -143,41 +209,45 @@ class SyncManager
                 LanAddress.logCandidates(ip)
                 if (ip == null) throw IllegalStateException(context.getString(R.string.sync_error_no_network))
 
-                SyncForegroundService.start(context)
+                foregroundToken = SyncForegroundService.start(context)
                 val srv = WsServer()
                 server = srv
                 val port = srv.start()
                 val exp = System.currentTimeMillis() / 1000 + QrCodec.DEFAULT_TTL_SECONDS
-                val qrRole = if (role == SyncRole.SENDER) QrCodec.ROLE_SENDER else QrCodec.ROLE_RECEIVER
-                val qrText =
-                    QrCodec.build(
+                val pairing =
+                    HostPairing(
                         sessionId = sessionId,
                         masterKey = master,
                         ip = ip,
                         port = port,
                         deviceName = deviceIdentity.deviceName(),
-                        expEpochSeconds = exp,
-                        role = qrRole,
-                        sessionBound = sessionBoundQr,
-                    )
-                _state.value =
-                    SyncState.ShowingQr(
-                        qrText = qrText,
-                        sas = sas,
-                        expiresAtEpochSeconds = exp,
+                        role = if (role == SyncRole.SENDER) QrCodec.ROLE_SENDER else QrCodec.ROLE_RECEIVER,
                         sending = role == SyncRole.SENDER,
-                        address = "$ip:$port",
                     )
+                hostPairing = pairing
+                hostExpiresAtEpochSeconds = exp
+                _state.value = showingQr(pairing, exp, QrCodec.DEFAULT_TTL_SECONDS)
 
-                val conn = srv.awaitConnection()
+                val conn = awaitPeer(srv)
                 connection = conn
                 _state.value = SyncState.Connecting
                 val result = runProtocol(conn, isHost = true, role = role, keys, sessionId, sas, collections)
                 _state.value = SyncState.Done(result.peerName, result.stats)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Throwable) {
                 failWith(e)
             } finally {
                 cleanup()
+            }
+        }
+
+        /** Wait for the scanner until the shown code lapses (a manual share can extend it meanwhile). */
+        private suspend fun awaitPeer(srv: WsServer): SyncConnection {
+            while (true) {
+                val remainingMs = hostExpiresAtEpochSeconds * 1000 - System.currentTimeMillis()
+                if (remainingMs <= 0) throw IllegalStateException(context.getString(R.string.sync_error_no_peer))
+                withTimeoutOrNull(remainingMs) { srv.awaitConnection() }?.let { return it }
             }
         }
 
@@ -211,17 +281,34 @@ class SyncManager
                 directionalKeys = keys
                 val sas = SyncCrypto.sas(master, parsed.sessionId)
 
-                SyncForegroundService.start(context)
+                foregroundToken = SyncForegroundService.start(context)
                 _state.value = SyncState.Connecting
-                val conn = WsClient(okHttpClient).connect(parsed.wsUrl)
+                val conn = connectAny(parsed.wsUrls)
                 connection = conn
                 val result = runProtocol(conn, isHost = false, role = role, keys, parsed.sessionId, sas, collections)
                 _state.value = SyncState.Done(result.peerName, result.stats)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Throwable) {
                 failWith(e)
             } finally {
                 cleanup()
             }
+        }
+
+        /** Dial each address the code offers, best first, until one answers. */
+        private suspend fun connectAny(urls: List<String>): SyncConnection {
+            var lastError: Throwable = IOException("no address to dial")
+            for (url in urls) {
+                try {
+                    return WsClient(okHttpClient).connect(url)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    lastError = e
+                }
+            }
+            throw lastError
         }
 
         private suspend fun runProtocol(
@@ -256,7 +343,7 @@ class SyncManager
                     sessionId = sessionId,
                     sasDigits = sas,
                     localHello = hello,
-                    localCaps = androidCapabilities(),
+                    localCaps = androidCapabilities(applier.neuroKeyLanguage()),
                     localSelection = selection,
                     callbacks = callbacks,
                     buildPayload = { cols: List<String> -> applier.exportPayload(cols, node, hlc) },
@@ -292,22 +379,24 @@ class SyncManager
                 }
             }
 
-        private fun androidCapabilities() =
+        private fun androidCapabilities(keyLanguage: String) =
             Capabilities(
                 mapOf(
                     SyncCollection.WATCH_HISTORY to Capability(1, produce = true, consume = true),
                     SyncCollection.PLAYLISTS to Capability(1, produce = true, consume = true),
                     SyncCollection.LIKES to Capability(1, produce = true, consume = true),
                     SyncCollection.SETTINGS to Capability(1, produce = true, consume = true),
-                    SyncCollection.FLOW_NEURO_BRAIN to Capability(13, produce = true, consume = true),
+                    SyncCollection.FLOW_NEURO_BRAIN to
+                        Capability(13, produce = true, consume = true, keySpec = NeuroKeySpec.VERSION, keyLanguage = keyLanguage),
                     SyncCollection.SUBSCRIBED_CHANNELS to Capability(1, produce = true, consume = true),
                     SyncCollection.SUBSCRIPTIONS to Capability(1, produce = true, consume = true),
                     SyncCollection.MUSIC_BRAIN to Capability(1, produce = true, consume = true),
+                    SyncCollection.NOTES to Capability(1, produce = true, consume = true),
                 ),
             )
 
         private fun failWith(e: Throwable) {
-            _state.value = SyncState.Failed(e.message ?: "Sync failed")
+            _state.value = SyncState.Failed(SyncErrorMessages.describe(context, e))
         }
 
         private fun cleanup() {
@@ -321,7 +410,9 @@ class SyncManager
             masterKey = null
             sasDeferred = null
             consentDeferred = null
-            runCatching { SyncForegroundService.stop(context) }
+            hostPairing = null
+            foregroundToken?.let { token -> runCatching { SyncForegroundService.stop(context, token) } }
+            foregroundToken = null
         }
 
         private fun qrErrorMessage(error: QrCodec.QrError): String =
@@ -341,6 +432,10 @@ class SyncManager
 
                     QrCodec.QrError.BAD_ADDRESS -> {
                         R.string.sync_error_qr_bad_address
+                    }
+
+                    QrCodec.QrError.NOT_LOCAL -> {
+                        R.string.sync_error_qr_not_local
                     }
                 },
             )

@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import io.github.aedev.flow.R
 
 /**
@@ -18,19 +19,28 @@ import io.github.aedev.flow.R
  * + ongoing notification.
  */
 class SyncForegroundService : Service() {
-
     override fun onBind(intent: Intent?): IBinder? = null
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        ensureChannel()
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.sync_notification_title))
-            .setContentText(getString(R.string.sync_notification_text))
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
-        startForegroundCompat(notification)
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int,
+    ): Int {
+        ensureChannel(this)
+        val notification =
+            NotificationCompat
+                .Builder(this, CHANNEL_ID)
+                .setContentTitle(getString(R.string.sync_notification_title))
+                .setContentText(getString(R.string.sync_notification_text))
+                .setSmallIcon(android.R.drawable.stat_sys_upload)
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+        val promoted = runCatching { startForegroundCompat(notification) }.isSuccess
+        if (gate.promoted() || !promoted) {
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
         return START_NOT_STICKY
     }
 
@@ -42,36 +52,52 @@ class SyncForegroundService : Service() {
         }
     }
 
-    private fun ensureChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            if (mgr.getNotificationChannel(CHANNEL_ID) == null) {
-                mgr.createNotificationChannel(
-                    NotificationChannel(
-                        CHANNEL_ID,
-                        getString(R.string.sync_notification_channel),
-                        NotificationManager.IMPORTANCE_LOW,
-                    )
-                )
-            }
-        }
-    }
-
     companion object {
-        private const val CHANNEL_ID = "flow_device_sync"
+        /** The low-importance Device sync channel, which linked sync shares. */
+        const val CHANNEL_ID = "flow_device_sync"
         private const val NOTIF_ID = 4096
 
-        fun start(context: Context) {
+        private val gate = SyncForegroundGate()
+
+        /** Returns the token [stop] needs, so a stop from an earlier session can't end this one. */
+        fun start(context: Context): Long {
+            val token = gate.requestStart()
             val intent = Intent(context, SyncForegroundService::class.java)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: RuntimeException) {
+                gate.startFailed()
+                throw e
+            }
+            return token
+        }
+
+        fun ensureChannel(context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+                val mgr = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                if (mgr.getNotificationChannel(CHANNEL_ID) == null) {
+                    mgr.createNotificationChannel(
+                        NotificationChannel(
+                            CHANNEL_ID,
+                            context.getString(R.string.sync_notification_channel),
+                            NotificationManager.IMPORTANCE_LOW,
+                        ),
+                    )
+                }
             }
         }
 
-        fun stop(context: Context) {
-            context.stopService(Intent(context, SyncForegroundService::class.java))
+        fun stop(
+            context: Context,
+            token: Long,
+        ) {
+            if (gate.requestStop(token) == SyncForegroundGate.Stop.NOW) {
+                context.stopService(Intent(context, SyncForegroundService::class.java))
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 /*
  * Copyright (C) 2025-2026 Flow | A-EDev
  *
- * This file is part of Flow (https://github.com/A-EDev/Flow).
+ * This file is part of Flow (https://github.com/Flow-Tube/Flow).
  *
  * Flow is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -39,14 +39,23 @@ internal object NeuroVectorMath {
     /** Topics above this score are developing — decay slowly */
     const val DEVELOPING_TOPIC_THRESHOLD = 0.10
 
-    /** Established interests: half-life ~1400 interactions */
+    /** Established interests: half-life ~346 full-strength events */
     const val ESTABLISHED_DECAY_RATE = 0.998
 
-    /** Developing interests: half-life ~330 interactions */
+    /** Developing interests: half-life ~99 full-strength events */
     const val DEVELOPING_DECAY_RATE = 0.993
 
-    /** Emerging/noisy topics: half-life ~46 interactions*/
+    /** Emerging/noisy topics: half-life ~23 full-strength events */
     const val EMERGING_DECAY_RATE = 0.97
+
+    /**
+     * The learning rate of a full long-form watch. An event's strength is its rate against this one,
+     * so a Short (1 % of a watch) teaches and erases 1 % of what a watch does (#907).
+     */
+    const val DECAY_REFERENCE_RATE = 0.15
+
+    /** Slower decay prunes less, so the vector needs a hard size bound of its own. */
+    const val MAX_GLOBAL_TOPICS = 300
 
     const val NEGATIVE_PROPORTIONAL_EXPONENT = 1.5
     const val NEGATIVE_FLOOR_FACTOR = 0.3
@@ -55,6 +64,122 @@ internal object NeuroVectorMath {
     const val COMPRESSION_THRESHOLD = 0.6
     const val COMPRESSION_CEILING = 0.5
     const val COMPRESSION_FACTOR = 0.7
+
+    /**
+     * A vector indexed once for many [calculateCosineSimilarity] calls against it. rank() scores
+     * hundreds of candidates against the same user vectors; building these lookups per candidate
+     * was most of its cost.
+     */
+    class PreparedVector(
+        val vector: ContentVector,
+    ) {
+        internal val baseToTagged = HashMap<String, Pair<String, Double>>(vector.topics.size)
+        internal val untagged = HashMap<String, Double>(vector.topics.size)
+        internal val magnitudeSquared: Double
+
+        init {
+            for ((k, v) in vector.topics) {
+                if (k.contains(':')) {
+                    baseToTagged.putIfAbsent(k.substringBefore(':'), k to v)
+                } else {
+                    untagged[k] = v
+                }
+            }
+            var sum = 0.0
+            vector.topics.values.forEach { sum += it * it }
+            magnitudeSquared = sum
+        }
+    }
+
+    /**
+     * How much [content]'s topics overlap [user]'s, from 0 to 1, without duration, pacing and
+     * complexity: two videos that share no topic score 0 however alike their length. A [specificity]
+     * scales each shared key by its square, so sharing "normal" or "top" counts for little (#907).
+     */
+    fun topicSimilarity(
+        user: PreparedVector,
+        content: ContentVector,
+        specificity: ((String) -> Double)? = null,
+    ): Double {
+        if (content.topics.isEmpty() || user.magnitudeSquared <= 0.0) return 0.0
+        var dotProduct = 0.0
+        var magnitude = 0.0
+        for ((key, value) in content.topics) {
+            magnitude += value * value
+            val match =
+                user.vector.topics[key]
+                    ?: if (':' in key) {
+                        user.untagged[key.substringBefore(':')]?.times(0.3)
+                    } else {
+                        user.baseToTagged[key]?.second?.times(0.3)
+                    }
+            if (match != null) {
+                val weight = specificity?.invoke(key) ?: 1.0
+                dotProduct += value * match * weight * weight
+            }
+        }
+        return if (dotProduct > 0.0 && magnitude > 0.0) dotProduct / (sqrt(user.magnitudeSquared) * sqrt(magnitude)) else 0.0
+    }
+
+    /** Same result as [calculateCosineSimilarity] with [user] as the first argument. */
+    fun calculateCosineSimilarity(
+        user: PreparedVector,
+        content: ContentVector,
+    ): Double {
+        // The index covers the larger side; when the content is not the smaller one, fall back so
+        // the migration matches run in the same direction as before.
+        if (user.vector.topics.size <= content.topics.size) return calculateCosineSimilarity(user.vector, content)
+        val userVector = user.vector
+        val scalarScore = scalarSimilarity(userVector, content)
+        if (content.topics.isEmpty()) return scalarScore * SCALAR_ONLY_DAMP
+
+        var dotProduct = 0.0
+        var hasIntersection = false
+        for ((key, smallVal) in content.topics) {
+            val exactMatch = userVector.topics[key]
+            if (exactMatch != null) {
+                dotProduct += smallVal * exactMatch
+                hasIntersection = true
+                continue
+            }
+            if (!key.contains(":")) {
+                val taggedMatch = user.baseToTagged[key]
+                if (taggedMatch != null) {
+                    dotProduct += smallVal * taggedMatch.second * 0.3
+                    hasIntersection = true
+                }
+            } else {
+                val untaggedMatch = user.untagged[key.substringBefore(":")]
+                if (untaggedMatch != null) {
+                    dotProduct += smallVal * untaggedMatch * 0.3
+                    hasIntersection = true
+                }
+            }
+        }
+        if (!hasIntersection) return scalarScore * SCALAR_ONLY_DAMP
+
+        var magnitudeB = 0.0
+        content.topics.values.forEach { magnitudeB += it * it }
+        val topicSim =
+            if (user.magnitudeSquared > 0 && magnitudeB > 0) {
+                dotProduct / (sqrt(user.magnitudeSquared) * sqrt(magnitudeB))
+            } else {
+                0.0
+            }
+        return (topicSim * TOPIC_SIMILARITY_WEIGHT) + scalarScore
+    }
+
+    private fun scalarSimilarity(
+        user: ContentVector,
+        content: ContentVector,
+    ): Double {
+        val durationSim = 1.0 - abs(user.duration - content.duration)
+        val pacingSim = 1.0 - abs(user.pacing - content.pacing)
+        val complexitySim = 1.0 - abs(user.complexity - content.complexity)
+        return (durationSim * DURATION_SIMILARITY_WEIGHT) +
+            (pacingSim * PACING_SIMILARITY_WEIGHT) +
+            (complexitySim * COMPLEXITY_SIMILARITY_WEIGHT)
+    }
 
     fun calculateCosineSimilarity(
         user: ContentVector,
@@ -135,10 +260,121 @@ internal object NeuroVectorMath {
         return (topicSim * TOPIC_SIMILARITY_WEIGHT) + scalarScore
     }
 
+    /**
+     * How a taste vector remembers. A topic's weight is 1 − e^(−E/[saturation]) for its evidence E:
+     * what each watch gave it (its weight in the video, times the watch's strength against a full
+     * one), halved every [halfLife] full watches. A topic in every video therefore ends above one
+     * in a few of them, which pulling toward each video's weight never allowed (#907).
+     */
+    class Horizon(
+        val saturation: Double,
+        val halfLife: Double,
+        val maxTopics: Int,
+    )
+
+    /** Months of watching; the brain's global vector, which sync and older builds read as before. */
+    val LONG_TERM = Horizon(saturation = 30.0, halfLife = 600.0, maxTopics = MAX_GLOBAL_TOPICS)
+
+    /** The last evening or so; device-local, and a quarter of the taste rank() scores with. */
+    val RECENT = Horizon(saturation = 3.0, halfLife = 25.0, maxTopics = 60)
+
+    /** Time-of-day vectors learn like the long-term one, each from fewer watches. */
+    val TIME_OF_DAY = Horizon(saturation = 30.0, halfLife = 600.0, maxTopics = 100)
+
+    const val RECENT_SHARE = 0.25
+
+    /** Below this a topic carries less evidence than a quarter of one full watch. */
+    const val EVIDENCE_PRUNE_THRESHOLD = 0.005
+
+    /** A word whose phrase holds this many times its weight is that phrase, not an interest of its own. */
+    const val PHRASE_ABSORB_RATIO = 10.0
+
+    private const val MAX_WEIGHT = 0.999999
+
+    /**
+     * Adds a positive event of [strength] (1 = a full watch) to [current] on [horizon]. [scalarRate]
+     * moves duration, pacing and complexity as [adjustVector] does. [protected] keys are never
+     * absorbed into a phrase or capped away.
+     */
+    fun learn(
+        current: ContentVector,
+        video: ContentVector,
+        strength: Double,
+        horizon: Horizon,
+        scalarRate: Double,
+        protected: Set<String> = emptySet(),
+    ): ContentVector {
+        val keep = 0.5.pow(strength / horizon.halfLife)
+        val topics = HashMap<String, Double>(current.topics.size + video.topics.size)
+        current.topics.forEach { (key, weight) ->
+            val decayed = 1.0 - (1.0 - weight.coerceAtMost(MAX_WEIGHT)).pow(keep)
+            if (decayed >= EVIDENCE_PRUNE_THRESHOLD || key in video.topics) topics[key] = decayed
+        }
+        video.topics.forEach { (key, share) ->
+            val remaining = 1.0 - (topics[key] ?: 0.0).coerceAtMost(MAX_WEIGHT)
+            topics[key] = 1.0 - remaining * exp(-strength * share / horizon.saturation)
+        }
+        absorbPhraseWords(topics, protected)
+
+        fun scalar(
+            currentScalar: Double,
+            targetScalar: Double,
+        ) = (currentScalar + (targetScalar - currentScalar) * scalarRate * (1.0 - currentScalar).pow(2)).coerceIn(0.0, 1.0)
+        return capTopics(
+            current.copy(
+                topics = topics,
+                duration = scalar(current.duration, video.duration),
+                pacing = scalar(current.pacing, video.pacing),
+                complexity = scalar(current.complexity, video.complexity),
+                isLive = scalar(current.isLive, video.isLive),
+            ),
+            horizon.maxTopics,
+            protected,
+        )
+    }
+
+    /**
+     * Drops words a phrase of theirs outweighs [PHRASE_ABSORB_RATIO] times: learned before the phrase
+     * was known, they would otherwise match any title that uses the word ("camera" from "camera test").
+     */
+    private fun absorbPhraseWords(
+        topics: MutableMap<String, Double>,
+        protected: Set<String>,
+    ) {
+        val strongestPhraseByWord = HashMap<String, Double>()
+        topics.forEach { (key, weight) ->
+            val base = NeuroScoring.stripDomainTag(key)
+            if (' ' in base) base.split(' ').forEach { strongestPhraseByWord.merge(it, weight, ::maxOf) }
+        }
+        if (strongestPhraseByWord.isEmpty()) return
+        topics.entries.removeIf { (key, weight) ->
+            ' ' !in key && key !in protected && (strongestPhraseByWord[key] ?: 0.0) > weight * PHRASE_ABSORB_RATIO
+        }
+    }
+
+    /**
+     * The taste rank() scores with: [longTerm] and [recent] each scaled to unit length, recent at
+     * [recentShare]. Duration, pacing and complexity come from [longTerm].
+     */
+    fun blend(
+        longTerm: ContentVector,
+        recent: ContentVector,
+        recentShare: Double = RECENT_SHARE,
+    ): ContentVector {
+        val recentLength = sqrt(recent.topics.values.sumOf { it * it })
+        if (recentLength <= 0.0) return longTerm
+        val longLength = sqrt(longTerm.topics.values.sumOf { it * it })
+        val topics = HashMap<String, Double>(longTerm.topics.size + recent.topics.size)
+        if (longLength > 0.0) longTerm.topics.forEach { (key, weight) -> topics[key] = weight / longLength * (1.0 - recentShare) }
+        recent.topics.forEach { (key, weight) -> topics.merge(key, weight / recentLength * recentShare, Double::plus) }
+        return longTerm.copy(topics = topics)
+    }
+
     fun adjustVector(
         current: ContentVector,
         target: ContentVector,
         baseRate: Double,
+        pruneBelow: Double = TOPIC_PRUNE_THRESHOLD,
     ): ContentVector {
         val newTopics = current.topics.toMutableMap()
         val isNegative = baseRate < 0
@@ -179,7 +415,7 @@ internal object NeuroVectorMath {
                     }
                 entry.setValue(entry.value * tieredDecay)
             }
-            if (!isCurrentTarget && entry.value < TOPIC_PRUNE_THRESHOLD) {
+            if (!isCurrentTarget && entry.value < pruneBelow) {
                 iterator.remove()
             }
         }
@@ -244,18 +480,87 @@ internal object NeuroVectorMath {
         source: ContentVector,
         floor: Double,
         topK: Int,
+        plantable: (String) -> Boolean = { true },
     ): ContentVector {
         if (source.topics.isEmpty()) return current
+        return plantKeys(current, selectPlantKeys(source, topK, plantable), floor)
+    }
+
+    /** How much of its weight a word keeps when a stronger phrase of the same video contains it. */
+    const val PHRASE_WORD_SHARE = 0.5
+
+    /**
+     * The vector a positive signal learns from. A word gives way to a phrase of the same video that
+     * outweighs it, so "guitar playalong" becomes the interest rather than "guitar" alone. A pair the
+     * engine does not yet know is a phrase weighs less than its words and takes nothing from them.
+     */
+    fun phraseFirst(
+        vector: ContentVector,
+        wordShare: Double = PHRASE_WORD_SHARE,
+    ): ContentVector {
+        val strongestPhraseByWord = HashMap<String, Double>()
+        vector.topics.forEach { (key, weight) ->
+            val base = NeuroScoring.stripDomainTag(key)
+            if (' ' in base) base.split(' ').forEach { strongestPhraseByWord.merge(it, weight, ::maxOf) }
+        }
+        if (strongestPhraseByWord.isEmpty()) return vector
+        return vector.copy(
+            topics =
+                vector.topics.mapValues { (key, weight) ->
+                    val base = NeuroScoring.stripDomainTag(key)
+                    val phrase = strongestPhraseByWord[base]
+                    if (' ' !in base && phrase != null && phrase >= weight) weight * wordShare else weight
+                },
+        )
+    }
+
+    /**
+     * Phrase keys first, and never the words of a planted phrase: planting
+     * "hip hop" beside "hip" and "hop" gives generic words the same weight as
+     * the interest itself. Only [plantable] keys qualify.
+     */
+    fun selectPlantKeys(
+        source: ContentVector,
+        topK: Int,
+        plantable: (String) -> Boolean = { true },
+    ): List<String> {
+        val ranked =
+            source.topics.entries
+                .sortedByDescending { it.value }
+                .map { it.key }
+                .filter { NeuroText.isTopicSized(NeuroScoring.stripDomainTag(it)) && plantable(it) }
+        val phrases = ranked.filter { ' ' in NeuroScoring.stripDomainTag(it) }.take(topK)
+        val phraseWords = phrases.flatMap { NeuroScoring.stripDomainTag(it).split(' ') }.toSet()
+        val words = ranked.filter { ' ' !in it && NeuroScoring.stripDomainTag(it) !in phraseWords }
+        return (phrases + words).take(topK)
+    }
+
+    fun plantKeys(
+        current: ContentVector,
+        keys: List<String>,
+        floor: Double,
+    ): ContentVector {
+        if (keys.isEmpty()) return current
         val planted = current.topics.toMutableMap()
-        source.topics.entries
-            .sortedByDescending { it.value }
-            .asSequence()
-            .filter { it.key.length >= 3 }
-            .take(topK)
-            .forEach { (topic, _) ->
-                if ((planted[topic] ?: 0.0) < floor) planted[topic] = floor
-            }
+        keys.forEach { topic ->
+            if ((planted[topic] ?: 0.0) < floor) planted[topic] = floor
+        }
         return current.copy(topics = planted)
+    }
+
+    /** Keeps the [max] strongest topics; [protected] keys always stay. */
+    fun capTopics(
+        vector: ContentVector,
+        max: Int,
+        protected: Set<String> = emptySet(),
+    ): ContentVector {
+        if (vector.topics.size <= max) return vector
+        val kept =
+            vector.topics.entries
+                .sortedByDescending { it.value }
+                .filterIndexed { index, entry -> index < max || NeuroScoring.stripDomainTag(entry.key) in protected }
+                .associate { it.key to it.value }
+        return vector.copy(topics = kept)
     }
 
     fun normalizeTopicVector(topics: MutableMap<String, Double>): Map<String, Double> {

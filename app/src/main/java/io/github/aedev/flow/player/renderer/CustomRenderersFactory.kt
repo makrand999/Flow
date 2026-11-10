@@ -15,31 +15,47 @@ import androidx.media3.exoplayer.text.TextOutput
 import androidx.media3.exoplayer.text.TextRenderer
 import androidx.media3.exoplayer.video.MediaCodecVideoRenderer
 import androidx.media3.exoplayer.video.VideoRendererEventListener
+import androidx.media3.extractor.text.DefaultSubtitleParserFactory
 import androidx.media3.extractor.text.SubtitleDecoder
 import io.github.aedev.flow.player.config.PlayerConfig
-import io.github.aedev.flow.player.renderer.subtitle.Srv3SubtitleDecoder
+import io.github.aedev.flow.player.renderer.subtitle.DelayedSubtitleDecoder
 import io.github.aedev.flow.player.renderer.subtitle.Srv3SubtitleParser
+import io.github.aedev.flow.player.subtitle.SubtitleDelay
 import java.util.ArrayList
 
 /**
- * A [DefaultRenderersFactory] that uses [CustomMediaCodecVideoRenderer] for video rendering
- * and optionally installs custom [AudioProcessor]s (e.g. the parametric EQ) into the audio sink.
+ * A [DefaultRenderersFactory] that builds the video renderer itself and optionally installs custom
+ * [AudioProcessor]s (e.g. the parametric EQ) into the audio sink.
  */
 open class CustomRenderersFactory(
     context: Context,
     private val audioProcessors: Array<AudioProcessor> = emptyArray(),
+    private val subtitleDelay: SubtitleDelay = SubtitleDelay(),
 ) : DefaultRenderersFactory(context) {
-    /** Adds srv3 support (YouTube's styled/positioned caption XML) on top of Media3's defaults. */
+    /**
+     * Media3's decoders plus srv3 (YouTube's styled, positioned caption XML), with every track a
+     * Media3 parser reads shifted by [subtitleDelay]. CEA-608/708 keep Media3's own decoders.
+     */
     private val subtitleDecoderFactory =
         object : SubtitleDecoderFactory {
+            private val parsers = DefaultSubtitleParserFactory()
+
             override fun supportsFormat(format: Format): Boolean =
                 format.sampleMimeType == Srv3SubtitleParser.MIME_TYPE || SubtitleDecoderFactory.DEFAULT.supportsFormat(format)
 
             override fun createDecoder(format: Format): SubtitleDecoder =
-                if (format.sampleMimeType == Srv3SubtitleParser.MIME_TYPE) {
-                    Srv3SubtitleDecoder()
-                } else {
-                    SubtitleDecoderFactory.DEFAULT.createDecoder(format)
+                when {
+                    format.sampleMimeType == Srv3SubtitleParser.MIME_TYPE -> {
+                        DelayedSubtitleDecoder("Srv3SubtitleDecoder", Srv3SubtitleParser(), subtitleDelay)
+                    }
+
+                    parsers.supportsFormat(format) -> {
+                        DelayedSubtitleDecoder("Delayed${format.sampleMimeType}", parsers.create(format), subtitleDelay)
+                    }
+
+                    else -> {
+                        SubtitleDecoderFactory.DEFAULT.createDecoder(format)
+                    }
                 }
         }
 
@@ -69,22 +85,21 @@ open class CustomRenderersFactory(
         allowedVideoJoiningTimeMs: Long,
         out: ArrayList<Renderer>,
     ) {
-        // Mirrors DefaultRenderersFactory.buildVideoRenderers so the custom renderer keeps the same
-        // configuration; this override is the reason setEnableMediaCodecVideoRendererDurationToProgressUs
-        // on the factory does nothing for us, so the flag is applied here instead.
+        // Mirrors DefaultRenderersFactory.buildVideoRenderers for the MediaCodec renderer alone; this
+        // override is the reason setEnableMediaCodecVideoRendererDurationToProgressUs on the factory
+        // does nothing for us, so the flag is applied here instead.
         out.add(
-            CustomMediaCodecVideoRenderer(
-                MediaCodecVideoRenderer
-                    .Builder(context)
-                    .setCodecAdapterFactory(codecAdapterFactory)
-                    .setMediaCodecSelector(mediaCodecSelector)
-                    .setAllowedJoiningTimeMs(allowedVideoJoiningTimeMs)
-                    .setEnableDecoderFallback(enableDecoderFallback)
-                    .setEventHandler(eventHandler)
-                    .setEventListener(eventListener)
-                    .setMaxDroppedFramesToNotify(MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY)
-                    .setEnableDurationToProgressUs(PlayerConfig.ENABLE_DYNAMIC_SCHEDULING),
-            ),
+            MediaCodecVideoRenderer
+                .Builder(context)
+                .setCodecAdapterFactory(codecAdapterFactory)
+                .setMediaCodecSelector(mediaCodecSelector)
+                .setAllowedJoiningTimeMs(allowedVideoJoiningTimeMs)
+                .setEnableDecoderFallback(enableDecoderFallback)
+                .setEventHandler(eventHandler)
+                .setEventListener(eventListener)
+                .setMaxDroppedFramesToNotify(MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY)
+                .setEnableDurationToProgressUs(PlayerConfig.ENABLE_DYNAMIC_SCHEDULING)
+                .build(),
         )
     }
 

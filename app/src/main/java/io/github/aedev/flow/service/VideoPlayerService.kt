@@ -12,6 +12,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import dagger.hilt.android.EntryPointAccessors
 import io.github.aedev.flow.R
 import io.github.aedev.flow.notification.NotificationHelper
 import io.github.aedev.flow.player.EnhancedPlayerManager
@@ -22,6 +23,9 @@ import io.github.aedev.flow.utils.FlowCrashHandler
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 @UnstableApi
@@ -106,12 +110,27 @@ class VideoPlayerService : MediaSessionService() {
                 updateLocks(isPlaybackActiveForLocks())
             }
         }
+        lifecycleScope.launch {
+            // A headphone Play after a video must not start the saved music queue (#1450).
+            EnhancedPlayerManager
+                .getInstance()
+                .playerState
+                .map { it.isPlaying }
+                .distinctUntilChanged()
+                .filter { it }
+                .collect { HeadphoneResume.set(this@VideoPlayerService, allowed = false) }
+        }
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
-        EnhancedPlayerManager.getInstance().initialize(applicationContext)
+        val manager = EnhancedPlayerManager.getInstance()
+        manager.initialize(applicationContext)
         serviceLog("onGetSession controller=${controllerInfo.packageName}")
-        return EnhancedPlayerManager.getInstance().getVideoMediaSession()
+        if (controllerInfo.declinesMediaButtonStart(hasMediaItem = manager.getPlayer()?.currentMediaItem != null)) {
+            serviceLog("onGetSession declined: media button with nothing to play")
+            return null
+        }
+        return manager.getVideoMediaSession()
     }
 
     override fun onStartCommand(
@@ -120,10 +139,7 @@ class VideoPlayerService : MediaSessionService() {
         startId: Int,
     ): Int {
         val startResult = super.onStartCommand(intent, flags, startId)
-        FlowCrashHandler.recordPhase(
-            "video-service",
-            "onStartCommand action=${intent?.action} startId=$startId",
-        )
+        FlowCrashHandler.recordPhase("video-service", "onStartCommand action=${intent?.action}")
         serviceLog("onStartCommand action=${intent?.action}")
 
         when (intent?.action) {
@@ -145,11 +161,19 @@ class VideoPlayerService : MediaSessionService() {
             return
         }
 
-        if (isPlaybackOngoing()) return
+        val keepPlayingAfterSwipe =
+            EntryPointAccessors
+                .fromApplication(applicationContext, PlaybackServiceEntryPoint::class.java)
+                .lifecyclePlaybackPreferences()
+                .settings.keepPlayingAfterSwipe
+        val player = EnhancedPlayerManager.getInstance().getPlayer()
+        if (player?.keepsPlayingOnTaskRemoved(keepPlayingAfterSwipe, isPlaybackOngoing()) == true) return
 
         EnhancedPlayerManager.getInstance().stop()
         releaseLocks()
-        stopSelf()
+        // Unlike a bare stopSelf(), this clears Media3's user-engaged state, so the pause cannot put
+        // the stopped service back into the foreground (#1025).
+        pauseAllPlayersAndStopSelf()
     }
 
     override fun onDestroy() {

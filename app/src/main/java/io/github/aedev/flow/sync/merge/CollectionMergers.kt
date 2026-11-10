@@ -1,7 +1,9 @@
 package io.github.aedev.flow.sync.merge
 
+import io.github.aedev.flow.sync.canonical.CanonicalGroupMember
 import io.github.aedev.flow.sync.canonical.CanonicalLike
 import io.github.aedev.flow.sync.canonical.CanonicalLikeMeta
+import io.github.aedev.flow.sync.canonical.CanonicalNote
 import io.github.aedev.flow.sync.canonical.CanonicalSetting
 import io.github.aedev.flow.sync.canonical.CanonicalSubscribedChannel
 import io.github.aedev.flow.sync.canonical.CanonicalSubscriptionGroup
@@ -149,6 +151,41 @@ object SubscribedChannelsMerger {
     private fun contentKey(c: CanonicalSubscribedChannel) = "${c.subscribedAtMs}|${c.deleted}|${c.name}"
 }
 
+/**
+ * A note is one field the user typed, so the later edit wins outright. Deletion is a tombstone
+ * carrying its own time — dropping the row instead would let a peer resurrect a note the user cleared.
+ */
+object NotesMerger {
+    fun merge(
+        local: List<CanonicalNote>,
+        remote: List<CanonicalNote>,
+    ): List<CanonicalNote> {
+        val byId = LinkedHashMap<String, CanonicalNote>(local.size + remote.size)
+        for (note in local) byId[note.id] = note
+        for (note in remote) {
+            val existing = byId[note.id]
+            byId[note.id] = if (existing == null) note else mergeOne(existing, note)
+        }
+        return byId.values.sortedBy { it.id }
+    }
+
+    fun mergeOne(
+        x: CanonicalNote,
+        y: CanonicalNote,
+    ): CanonicalNote =
+        when {
+            x.updatedAt != y.updatedAt -> if (x.updatedAt > y.updatedAt) x else y
+
+            // Same instant on two devices: deletion wins, so a clear is never undone by a stale edit.
+            x.deleted != y.deleted -> if (x.deleted) x else y
+
+            x.text != y.text -> if (x.text > y.text) x else y
+
+            // Filling in what a note is about leaves its time alone, so the copy that knows wins.
+            else -> if (x.title != null || y.title == null) x else y
+        }
+}
+
 object SubscriptionsMerger {
     fun merge(
         local: List<CanonicalSubscriptionGroup>,
@@ -167,17 +204,39 @@ object SubscriptionsMerger {
         x: CanonicalSubscriptionGroup,
         y: CanonicalSubscriptionGroup,
     ): CanonicalSubscriptionGroup {
-        val channelIds = (x.channelIds.toSet() + y.channelIds.toSet()).sorted() // OR-Set union
         val sortWinner = Crdt.preferByHlc(x, x.hlc, y, y.hlc) { it.sortOrder.toString() }
-        return CanonicalSubscriptionGroup(
+        return withMembers(
             name = x.name,
-            channelIds = channelIds,
+            members = members(x) + members(y),
             sortOrder = sortWinner.sortOrder,
             hlc = Crdt.maxHlc(x.hlc, y.hlc),
             deleted = Crdt.resolveDeleted(x.deleted, x.hlc, y.deleted, y.hlc),
         )
     }
 
-    /** Canonical form: channelIds sorted + de-duped, so `a ⊕ a == a`. */
-    private fun normalize(g: CanonicalSubscriptionGroup) = g.copy(channelIds = g.channelIds.toSortedSet().toList())
+    /** A record from an app without per-member stamps counts each of its channels as present at the record's stamp. */
+    private fun members(g: CanonicalSubscriptionGroup): List<CanonicalGroupMember> =
+        g.members.ifEmpty { g.channelIds.map { CanonicalGroupMember(it, g.hlc) } }
+
+    /** Per channel, last writer wins and a removal is a tombstone, as for playlist items. */
+    private fun withMembers(
+        name: String,
+        members: List<CanonicalGroupMember>,
+        sortOrder: Int,
+        hlc: String,
+        deleted: Boolean,
+    ): CanonicalSubscriptionGroup {
+        val merged =
+            members
+                .groupBy { it.channelId }
+                .map { (channelId, versions) ->
+                    versions.reduce { a, b ->
+                        CanonicalGroupMember(channelId, Crdt.maxHlc(a.hlc, b.hlc), Crdt.resolveDeleted(a.deleted, a.hlc, b.deleted, b.hlc))
+                    }
+                }.sortedBy { it.channelId }
+        return CanonicalSubscriptionGroup(name, merged.filter { !it.deleted }.map { it.channelId }, sortOrder, hlc, deleted, merged)
+    }
+
+    /** Canonical form: members merged and sorted, channelIds the live ones, so `a ⊕ a == a`. */
+    private fun normalize(g: CanonicalSubscriptionGroup) = withMembers(g.name, members(g), g.sortOrder, g.hlc, g.deleted)
 }

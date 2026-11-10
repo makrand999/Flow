@@ -1,6 +1,8 @@
 package io.github.aedev.flow.sync.canonical
 
 import io.github.aedev.flow.sync.identity.Hlc
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.MapSerializer
@@ -116,10 +118,39 @@ data class CanonicalSetting(
 )
 
 @Serializable
+data class CanonicalNote(
+    val id: String,
+    val targetId: String = "",
+    val kind: String = "",
+    val text: String = "",
+    val updatedAt: Long = 0L,
+    val deleted: Boolean = false,
+    val title: String? = null,
+    val channelName: String? = null,
+    val channelId: String? = null,
+    val thumbnailUrl: String? = null,
+    val durationSeconds: Int? = null,
+    val channelAvatarUrl: String? = null,
+    val channelHandle: String? = null,
+    val subscriberCountText: String? = null,
+)
+
+@Serializable
 data class CanonicalSubscriptionGroup(
     val name: String,
     val channelIds: List<String> = emptyList(),
     val sortOrder: Int = 0,
+    val hlc: String = "",
+    val deleted: Boolean = false,
+    /** Each channel's own stamp, so a removal can sync; `channelIds` stays the live list for apps without it. */
+    @OptIn(ExperimentalSerializationApi::class)
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
+    val members: List<CanonicalGroupMember> = emptyList(),
+)
+
+@Serializable
+data class CanonicalGroupMember(
+    val channelId: String,
     val hlc: String = "",
     val deleted: Boolean = false,
 )
@@ -321,12 +352,15 @@ data class CanonicalTopicEvidence(
     val lastSeenAt: Long = 0,
 )
 
-/** The blendable, experience-weighted learned vectors */
+/**
+ * The blendable, experience-weighted learned vectors. [shortsVector] is null for a device that has
+ * none (the desktop), which the blend must skip rather than average in as zeros.
+ */
 @Serializable
 data class CanonicalBrainVectors(
     val globalVector: CanonicalVector = CanonicalVector(),
     val timeVectors: Map<String, CanonicalVector> = emptyMap(),
-    val shortsVector: CanonicalVector = CanonicalVector(),
+    val shortsVector: CanonicalVector? = null,
     val topicAffinities: Map<String, Double> = emptyMap(),
     val channelScores: Map<String, Double> = emptyMap(),
     val channelTopicProfiles: Map<String, Map<String, Double>> = emptyMap(),

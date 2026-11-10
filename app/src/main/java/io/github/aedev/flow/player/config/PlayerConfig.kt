@@ -12,14 +12,11 @@ object PlayerConfig {
     /** Maximum cache size in bytes (500 MB — default) */
     const val CACHE_SIZE_BYTES = 500L * 1024L * 1024L
 
-    /** Cache size options (MB) shown in Settings. 0 = unlimited. */
-    val CACHE_SIZE_OPTIONS_MB = intArrayOf(100, 200, 500, 0)
-
-    /** Convert a cache size MB setting to bytes. 0 MB means unlimited (NoOpCacheEvictor). */
-    fun cacheSizeMbToBytes(mb: Int): Long = if (mb <= 0) 0L else mb * 1024L * 1024L
-
-    /** Cache directory name */
+    /** The video and Shorts cache folder; it held every player's data before songs got their own. */
     const val CACHE_DIR_NAME = "exoplayer"
+
+    /** The song and animated artwork cache folder. */
+    const val MUSIC_CACHE_DIR_NAME = "exoplayer_music"
 
     // ===== Buffer Configuration =====
 
@@ -32,14 +29,16 @@ object PlayerConfig {
     /** Back buffer duration for low-memory devices. */
     const val LOW_MEMORY_BACK_BUFFER_DURATION_MS = 0
 
-    /** Hard runtime cap for main-player max buffer */
-    const val MAX_SAFE_MAIN_BUFFER_MS = 45_000
+    /** The longest max buffer the main player takes, the top of the Custom slider. Bytes stop it sooner. */
+    const val MAX_SAFE_MAIN_BUFFER_MS = 180_000
 
     /** Hard runtime cap for main-player min buffer so low-RAM devices do not over-retain media. */
     const val MAX_SAFE_MAIN_MIN_BUFFER_MS = 20_000
 
-    /** Runtime caps used when Android reports a small app heap. */
+    /** Max buffer cap on a device Android flags as low-RAM. */
     const val LOW_MEMORY_MAX_SAFE_MAIN_BUFFER_MS = 18_000
+
+    /** Min buffer cap when Android reports a small app heap. */
     const val LOW_MEMORY_MAX_SAFE_MAIN_MIN_BUFFER_MS = 8_000
 
     const val MAIN_TARGET_BUFFER_BYTES = 32 * 1024 * 1024
@@ -47,6 +46,13 @@ object PlayerConfig {
     /** Smaller target buffer budgets for devices with 256-384 MB app heaps. */
     const val LOW_MEMORY_MAIN_TARGET_BUFFER_BYTES = 4 * 1024 * 1024
     const val MID_MEMORY_MAIN_TARGET_BUFFER_BYTES = 12 * 1024 * 1024
+
+    /**
+     * A max buffer longer than the stock profiles may hold up to this share of the app heap, since
+     * Media3's allocator keeps buffered media in heap arrays: 1/5 of a 256 MB heap is about 51 MB.
+     */
+    const val LONG_BUFFER_HEAP_DIVISOR = 5
+    const val MAX_LONG_BUFFER_BYTES = 128 * 1024 * 1024
 
     /** Explicit target buffer budget per shorts player in the pooled shorts stack. */
     const val SHORTS_TARGET_BUFFER_BYTES = 4 * 1024 * 1024
@@ -79,25 +85,20 @@ object PlayerConfig {
     /** Initial bandwidth estimate in bits per second (5 Mbps) */
     const val INITIAL_BANDWIDTH_ESTIMATE = 5_000_000L
 
-    /** Bandwidth threshold for 4K quality (15 Mbps) */
-    const val BANDWIDTH_4K = 25_000_000L
-
-    /** Bandwidth threshold for 1440p quality (10 Mbps) */
-    const val BANDWIDTH_1440P = 15_000_000L
-
-    /** Bandwidth threshold for 1080p quality (6 Mbps) */
-    const val BANDWIDTH_1080P = 8_000_000L
-
-    /** Bandwidth threshold for 720p quality (3 Mbps) */
-    const val BANDWIDTH_720P = 4_000_000L
-
-    /** Bandwidth threshold for 480p quality (1.5 Mbps) */
-    const val BANDWIDTH_480P = 2_000_000L
-
-    /** Bandwidth threshold for 360p quality (800 Kbps) */
-    const val BANDWIDTH_360P = 800_000L
-
     // ===== Quality Adaptation =====
+
+    /** Share of the bandwidth estimate a stream may use, for Auto's own picks and Media3's ladder alike. */
+    const val AUTO_BANDWIDTH_FRACTION = 0.7f
+
+    /** Buffer a ladder needs before Media3 moves it up a quality (Media3's default is 10 s). */
+    const val ABR_MIN_BUFFER_FOR_QUALITY_INCREASE_MS = 5_000
+
+    /**
+     * Media3 holds the current quality while more than this is buffered. At its 25 s default a full
+     * 45 s buffer drains for 20 s before a collapsed network steps down; the midpoint of the 20 s to
+     * 45 s window it was tuned on cuts that to 12.5 s.
+     */
+    const val ABR_MAX_BUFFER_FOR_QUALITY_DECREASE_MS = 32_500
 
     /** Interval for bandwidth checks during playback (5 seconds) */
     const val BANDWIDTH_CHECK_INTERVAL_MS = 5000L
@@ -166,35 +167,4 @@ object PlayerConfig {
     const val MAX_VIDEO_WIDTH = 3840
 
     const val MAX_VIDEO_HEIGHT = 2160
-
-    /**
-     * Calculate target quality height based on bandwidth in bits per second.
-     */
-    fun calculateTargetQualityForBandwidth(bandwidthBps: Long): Int =
-        when {
-            bandwidthBps > BANDWIDTH_4K -> 2160
-            bandwidthBps > BANDWIDTH_1440P -> 1440
-            bandwidthBps > BANDWIDTH_1080P -> 1080
-            bandwidthBps > BANDWIDTH_720P -> 720
-            bandwidthBps > BANDWIDTH_480P -> 480
-            bandwidthBps > BANDWIDTH_360P -> 360
-            else -> 240
-        }
-
-    /**
-     * Calculate initial quality target based on estimated bandwidth.
-     */
-    fun calculateInitialQualityTarget(estimatedBandwidth: Long): Int =
-        when {
-            estimatedBandwidth > 20_000_000 -> 1080
-
-            // Need very high bandwidth for default 1080p
-            estimatedBandwidth > 10_000_000 -> 720
-
-            estimatedBandwidth > 3_000_000 -> 480
-
-            estimatedBandwidth > 1_500_000 -> 360
-
-            else -> 240 // Low bandwidth = 240p
-        }
 }

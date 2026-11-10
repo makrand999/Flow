@@ -1,7 +1,7 @@
 /*
  * Copyright (C) 2025-2026 Flow | A-EDev
  *
- * This file is part of Flow (https://github.com/A-EDev/Flow).
+ * This file is part of Flow (https://github.com/Flow-Tube/Flow).
  */
 
 package io.github.aedev.flow.data.recommendation
@@ -13,6 +13,8 @@ import org.junit.Test
 
 class NeuroLearningFixesTest {
     private val tokenizer = NeuroTokenizer()
+
+    private fun key(phrase: String) = tokenizer.keysOf(phrase).single()
 
     // ── F2: topic acquisition floor ──
 
@@ -79,29 +81,125 @@ class NeuroLearningFixesTest {
 
     @Test
     fun `v15 maintenance scrubs junk and rehydrates from channel profiles`() {
-        val updated = NeuroMaintenance.runV15IfNeeded(fossilBrain(), tokenizer)
+        val updated = NeuroMaintenance.runIfNeeded(fossilBrain(), tokenizer)
 
         assertThat(updated.schemaVersion).isEqualTo(NeuroMaintenance.TARGET_SCHEMA_VERSION)
         // Junk scrubbed.
         assertThat(updated.globalVector.topics).doesNotContainKey("right")
         assertThat(updated.globalVector.topics).doesNotContainKey("laptops right")
         // Real interests recovered from profiles, capped below established.
-        assertThat(updated.globalVector.topics).containsKey("claude")
+        assertThat(updated.globalVector.topics).containsKey(key("claude"))
         assertThat(updated.globalVector.topics).containsKey("cars")
-        assertThat(updated.globalVector.topics.getValue("claude")).isAtMost(0.30)
+        assertThat(updated.globalVector.topics.getValue(key("claude"))).isAtMost(0.30)
         // Low-quality channels contribute nothing.
         assertThat(updated.globalVector.topics).doesNotContainKey("spam")
         // Affinity structure seeded from co-taught topics.
         assertThat(updated.topicAffinities).isNotEmpty()
-        assertThat(updated.topicAffinities.keys.any { it.contains("claude") }).isTrue()
+        assertThat(updated.topicAffinities.keys.any { it.contains(key("claude")) }).isTrue()
         // Existing scores never lowered.
         assertThat(updated.globalVector.topics.getValue("android")).isEqualTo(0.39)
     }
 
     @Test
-    fun `v15 maintenance is a no-op on current brains`() {
-        val brain = fossilBrain().copy(schemaVersion = 15)
-        assertThat(NeuroMaintenance.runV15IfNeeded(brain, tokenizer)).isSameInstanceAs(brain)
+    fun `maintenance is a no-op on current brains`() {
+        val brain = fossilBrain().copy(schemaVersion = NeuroMaintenance.TARGET_SCHEMA_VERSION)
+        assertThat(NeuroMaintenance.runIfNeeded(brain, tokenizer)).isSameInstanceAs(brain)
+    }
+
+    // ── #907: search queries plant phrases, not their words ──
+
+    private val floor = NeuroScoring.TOPIC_ACQUISITION_FLOOR
+
+    @Test
+    fun `multi-word search plants its phrase and catalog topics, never stray words`() {
+        val learned = NeuroSearchLearning.learn(UserBrain(), "lofi hip hop", tokenizer, now = 1_000L)!!
+        val topics = learned.globalVector.topics
+
+        listOf("lofi hip hop", "lofi", "hip hop").forEach { assertThat(topics.getValue(it)).isAtLeast(floor) }
+        assertThat(topics.keys).containsNoneOf("hip", "hop", "lofi hip")
+        assertThat(learned.topicEvidence.keys).containsExactly("lofi hip hop", "lofi", "hip hop")
+    }
+
+    @Test
+    fun `generic words of a query keep a weak contribution`() {
+        val learned = NeuroSearchLearning.learn(UserBrain(), "lofi hip hop", tokenizer, now = 1_000L)!!
+        assertThat(learned.globalVector.topics["lofi"] ?: 0.0).isGreaterThan(0.0)
+    }
+
+    @Test
+    fun `single-word search still plants the word`() {
+        val learned = NeuroSearchLearning.learn(UserBrain(), "woodworking", tokenizer, now = 1_000L)!!
+        assertThat(learned.globalVector.topics.getValue("woodworking")).isAtLeast(floor)
+        assertThat(learned.topicEvidence.getValue("woodworking").explicitSignals).isEqualTo(1)
+    }
+
+    @Test
+    fun `a search plants its catalog topic rather than a pair nobody knows`() {
+        val topics = NeuroSearchLearning.queryTopics("minecraft hardcore", tokenizer)
+        assertThat(topics.phrases).containsExactly("minecraft")
+        assertThat(topics.weakWords).containsExactly(key("hardcore"))
+    }
+
+    @Test
+    fun `a question plants what it asks about`() {
+        assertThat(NeuroSearchLearning.queryTopics("How does encryption work?", tokenizer).phrases).containsExactly(key("encryption"))
+        assertThat(NeuroSearchLearning.queryTopics("what is a quantum computer", tokenizer).phrases).containsExactly("quantum computer")
+        assertThat(NeuroSearchLearning.queryTopics("black holes explained", tokenizer).phrases).containsExactly(key("black holes"))
+    }
+
+    @Test
+    fun `a long search keeps every word and plants its known phrase`() {
+        val topics = NeuroSearchLearning.queryTopics("best budget gaming laptop for college students 2026", tokenizer)
+
+        assertThat(topics.phrases).contains("game laptop")
+        assertThat(topics.phrases + topics.weakWords).containsAtLeastElementsIn(listOf("budget", "college", "students").map(::key))
+    }
+
+    @Test
+    fun `blocked words never reach a planted phrase`() {
+        val topics = NeuroSearchLearning.queryTopics("lofi hip hop", tokenizer, blockedTopics = setOf("lofi"))
+        assertThat(topics.phrases).containsExactly("hip hop")
+        assertThat(topics.phrases + topics.weakWords).doesNotContain("lofi")
+    }
+
+    @Test
+    fun `plantTopics prefers bigrams and skips their words`() {
+        val source =
+            ContentVector(topics = mapOf("hip" to 0.9, "hop" to 0.8, "hip hop" to 0.5, "beats" to 0.3))
+        val planted = NeuroVectorMath.plantTopics(ContentVector(), source, floor, topK = 3)
+        assertThat(planted.topics.keys).containsExactly("hip hop", "beats")
+    }
+
+    private fun searchEvidence(time: Long) =
+        TopicEvidence(positiveSignals = 1, explicitSignals = 1, positiveScore = 0.5, firstSeenAt = time, lastSeenAt = time)
+
+    @Test
+    fun `v16 maintenance scrubs words planted by multi-word searches`() {
+        val words = listOf("lofi", "hip", "hop", "woodworking", "minecraft", "hardcore", "claude")
+        val brain =
+            UserBrain(
+                schemaVersion = 15,
+                globalVector = ContentVector(topics = words.associateWith { floor }),
+                topicEvidence =
+                    mapOf(
+                        "lofi" to searchEvidence(1_000L),
+                        "hip" to searchEvidence(1_000L),
+                        "hop" to searchEvidence(1_000L),
+                        "woodworking" to searchEvidence(2_000L),
+                        "minecraft" to searchEvidence(3_000L),
+                        "hardcore" to searchEvidence(3_000L),
+                        "claude" to searchEvidence(1_000L).copy(watchSignals = 1, videoIds = setOf("v1")),
+                    ),
+            )
+
+        val updated = NeuroMaintenance.runIfNeeded(brain, tokenizer)
+
+        assertThat(updated.schemaVersion).isEqualTo(NeuroMaintenance.TARGET_SCHEMA_VERSION)
+        // "lofi" is the catalog's "Lo-Fi", which catalog words keep.
+        assertThat(
+            updated.globalVector.topics.keys,
+        ).containsExactlyElementsIn(listOf("lofi", "woodworking", "minecraft", "claude").map(::key))
+        assertThat(updated.topicEvidence.keys).containsExactlyElementsIn(listOf("lofi", "woodworking", "minecraft", "claude").map(::key))
     }
 
     // ── F5: every cluster in every feed + tree-depth descent ──
@@ -143,5 +241,19 @@ class NeuroLearningFixesTest {
         assertThat(page2).isNotEqualTo(surface)
         assertThat(page2.any { it.contains(' ') }).isTrue()
         assertThat(page3).isNotEqualTo(page2)
+    }
+
+    @Test
+    fun `refresh queries narrow one-word anchors with a phrase from their own cluster`() {
+        val universe = NeuroBenchmark.multiInterestUniverse()
+        val brain = NeuroBenchmark.brainFor(universe)
+        val surface =
+            NeuroDiscovery(NeuroTopicCatalog.TOPIC_CATEGORIES, tokenizer)
+                .generateQueries(brain, NeuroEval.FIXED_NOW, depth = 0) { FlowPersona.EXPLORER }
+                .filter { it.strategy == QueryStrategy.DEEP_DIVE }
+                .map { it.query }
+
+        // #907: a bare "guitar" search returns generic popular videos that read as trending.
+        assertThat(surface.count { ' ' in it }).isAtLeast(surface.size - 1)
     }
 }

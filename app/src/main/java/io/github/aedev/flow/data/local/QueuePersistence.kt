@@ -10,8 +10,10 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import io.github.aedev.flow.ui.screens.music.MusicTrack
-import io.github.aedev.flow.ui.screens.music.withTypedArtists
+import io.github.aedev.flow.data.music.model.MusicTrack
+import io.github.aedev.flow.data.music.model.withTypedArtists
+import io.github.aedev.flow.data.profile.ProfileFiles
+import io.github.aedev.flow.data.profile.StoreScope
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -22,7 +24,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-private val Context.queueDataStore: DataStore<Preferences> by safePreferencesDataStore(name = "music_queue")
+private const val QUEUE_STORE_NAME = "music_queue"
+
+private val Context.queueDataStore: DataStore<Preferences> by safePreferencesDataStore(
+    name = QUEUE_STORE_NAME,
+    scope = StoreScope.PROFILE_PRIVATE,
+)
 
 class QueuePersistence private constructor(
     private val context: Context,
@@ -90,6 +97,11 @@ class QueuePersistence private constructor(
                 delay(SAVE_DEBOUNCE_MS)
                 saveQueueImmediate(queue, currentIndex, currentPosition, currentTrackId, shuffleEnabled, repeatMode, automix)
             }
+    }
+
+    /** Drops a debounced save that an immediate save is about to supersede; it would write older state. */
+    fun cancelPendingSave() {
+        saveJob?.cancel()
     }
 
     /**
@@ -204,28 +216,10 @@ class QueuePersistence private constructor(
     }
 
     /**
-     * Clear saved queue
+     * Whether a queue was ever saved, from the store's file alone. Only non-empty queues are written
+     * and nothing clears the store, so the file exists exactly when there is a queue to resume. A media
+     * button that cold-starts the music service needs this answer on the main thread, before any read
+     * of the store could finish.
      */
-    suspend fun clearQueue() {
-        try {
-            context.queueDataStore.edit { prefs ->
-                prefs.clear()
-            }
-            Log.d(TAG, "Queue cleared")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to clear queue", e)
-        }
-    }
-
-    /**
-     * Check if there's a saved queue
-     */
-    suspend fun hasSavedQueue(): Boolean =
-        try {
-            val prefs = context.queueDataStore.data.first()
-            val queueJson = prefs[QUEUE_KEY]
-            !queueJson.isNullOrBlank() && queueJson != "[]"
-        } catch (e: Exception) {
-            false
-        }
+    fun hasSavedQueueFile(): Boolean = ProfileFiles.preferences(context, StoreScope.PROFILE_PRIVATE, QUEUE_STORE_NAME).exists()
 }

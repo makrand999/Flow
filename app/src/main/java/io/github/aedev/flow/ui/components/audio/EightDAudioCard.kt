@@ -32,24 +32,25 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.aedev.flow.R
-import io.github.aedev.flow.player.audio.AudioEffectsController
+import io.github.aedev.flow.player.audio.EightDAudioController
 import io.github.aedev.flow.player.audio.EightDRoomPreset
 import kotlin.math.roundToInt
 
 /**
  * Material 3 control card for toggling and tuning the 8D Spatial Audio effect.
- * Coordinates with [AudioEffectsController] to update playback pipelines in real time.
+ * Coordinates with [EightDAudioController] to update playback pipelines in real time.
  */
 @Composable
 fun EightDAudioCard(modifier: Modifier = Modifier) {
-    val enabled by AudioEffectsController.eightDEnabled.collectAsState()
-    val speedSec by AudioEffectsController.eightDSpeed.collectAsState()
-    val depth by AudioEffectsController.eightDDepth.collectAsState()
-    val roomPreset by AudioEffectsController.eightDRoomPreset.collectAsState()
+    val enabled by EightDAudioController.enabled.collectAsState()
+    val speedSec by EightDAudioController.speed.collectAsState()
+    val depth by EightDAudioController.depth.collectAsState()
+    val roomPreset by EightDAudioController.roomPreset.collectAsState()
 
     Card(
         modifier = modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+        shape = MaterialTheme.shapes.large,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(
@@ -70,7 +71,7 @@ fun EightDAudioCard(modifier: Modifier = Modifier) {
                 }
                 Switch(
                     checked = enabled,
-                    onCheckedChange = { AudioEffectsController.setEightDEnabled(it) },
+                    onCheckedChange = { EightDAudioController.setEnabled(it) },
                 )
             }
 
@@ -84,7 +85,7 @@ fun EightDAudioCard(modifier: Modifier = Modifier) {
             Spacer(Modifier.height(8.dp))
             Surface(
                 shape = MaterialTheme.shapes.small,
-                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -124,7 +125,7 @@ fun EightDAudioCard(modifier: Modifier = Modifier) {
                             }
                         SegmentedButton(
                             selected = roomPreset == preset,
-                            onClick = { AudioEffectsController.setEightDRoomPreset(preset) },
+                            onClick = { EightDAudioController.setRoomPreset(preset) },
                             shape = SegmentedButtonDefaults.itemShape(index = index, count = EightDRoomPreset.entries.size),
                             icon = {},
                             label = {
@@ -148,7 +149,7 @@ fun EightDAudioCard(modifier: Modifier = Modifier) {
                 )
                 Slider(
                     value = speedSec,
-                    onValueChange = { AudioEffectsController.setEightDSpeed(it) },
+                    onValueChange = { EightDAudioController.setSpeed(it) },
                     valueRange = 6f..30f,
                     steps = 24,
                 )
@@ -162,7 +163,7 @@ fun EightDAudioCard(modifier: Modifier = Modifier) {
                 )
                 Slider(
                     value = depth,
-                    onValueChange = { AudioEffectsController.setEightDDepth(it) },
+                    onValueChange = { EightDAudioController.setDepth(it) },
                     valueRange = 0.2f..1.0f,
                     steps = 15,
                 )

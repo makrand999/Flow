@@ -1,6 +1,5 @@
 package io.github.aedev.flow.player.factory
 
-import android.app.ActivityManager
 import android.content.Context
 import android.util.Log
 import androidx.media3.common.AudioAttributes
@@ -16,11 +15,16 @@ import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.AdaptiveTrackSelection
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.exoplayer.upstream.BandwidthMeter
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
+import androidx.media3.exoplayer.util.EventLogger
+import io.github.aedev.flow.BuildConfig
 import io.github.aedev.flow.data.local.PlayerPreferences
 import io.github.aedev.flow.player.audio.shouldHandleAudioFocus
 import io.github.aedev.flow.player.config.PlayerConfig
+import io.github.aedev.flow.player.config.VideoSizeCap
 import io.github.aedev.flow.player.renderer.CustomRenderersFactory
+import io.github.aedev.flow.player.subtitle.SubtitleDelay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 
@@ -28,6 +32,7 @@ import kotlinx.coroutines.runBlocking
 class PlayerFactory {
     companion object {
         private const val TAG = "PlayerFactory"
+        private const val EVENT_LOG_TAG = "FlowVideoEvents"
     }
 
     private class CachedPrefs(
@@ -59,6 +64,11 @@ class PlayerFactory {
         return result
     }
 
+    /** Drops the preferences read for the released player, so the next one is built with today's settings. */
+    fun clearPreferences() {
+        cachedPrefs = null
+    }
+
     suspend fun preloadPreferences(context: Context) {
         if (cachedPrefs != null) return
         val prefs = PlayerPreferences(context)
@@ -77,13 +87,21 @@ class PlayerFactory {
         DefaultBandwidthMeter
             .Builder(context)
             .setInitialBitrateEstimate(PlayerConfig.INITIAL_BANDWIDTH_ESTIMATE)
-            .setResetOnNetworkTypeChange(false)
+            .setResetOnNetworkTypeChange(true)
             .build()
 
-    fun createTrackSelector(context: Context): DefaultTrackSelector {
-        val trackSelectionFactory = AdaptiveTrackSelection.Factory()
+    fun createTrackSelector(
+        context: Context,
+        videoSizeCap: VideoSizeCap,
+    ): DefaultTrackSelector {
+        val trackSelectionFactory =
+            AdaptiveTrackSelection.Factory(
+                PlayerConfig.ABR_MIN_BUFFER_FOR_QUALITY_INCREASE_MS,
+                PlayerConfig.ABR_MAX_BUFFER_FOR_QUALITY_DECREASE_MS,
+                AdaptiveTrackSelection.DEFAULT_MIN_DURATION_TO_RETAIN_AFTER_DISCARD_MS,
+                PlayerConfig.AUTO_BANDWIDTH_FRACTION,
+            )
         val prefs = ensurePrefs(context)
-        val (maxVideoWidth, maxVideoHeight) = maxVideoSizeForHeap(context)
 
         return DefaultTrackSelector(context, trackSelectionFactory).apply {
             val builder =
@@ -94,7 +112,7 @@ class PlayerFactory {
                     .setForceHighestSupportedBitrate(false)
                     .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
                     .setViewportSizeToPhysicalDisplaySize(context, true)
-                    .setMaxVideoSize(maxVideoWidth, maxVideoHeight)
+                    .setMaxVideoSize(videoSizeCap.maxWidth, videoSizeCap.maxHeight)
 
             when (prefs.audioLanguage) {
                 "original", "" -> {}
@@ -119,22 +137,12 @@ class PlayerFactory {
         )
     }
 
-    private fun maxVideoSizeForHeap(context: Context): Pair<Int, Int> {
-        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-        val memoryClassMb = activityManager?.memoryClass ?: 256
-        val isLowMemoryDevice = activityManager?.isLowRamDevice == true || memoryClassMb <= 256
-        return when {
-            isLowMemoryDevice -> 1920 to 1080
-            memoryClassMb <= 384 -> 2560 to 1440
-            else -> PlayerConfig.MAX_VIDEO_WIDTH to PlayerConfig.MAX_VIDEO_HEIGHT
-        }
-    }
-
     fun createRenderersFactory(
         context: Context,
         audioProcessors: Array<AudioProcessor> = emptyArray(),
+        subtitleDelay: SubtitleDelay = SubtitleDelay(),
     ): DefaultRenderersFactory =
-        CustomRenderersFactory(context, audioProcessors)
+        CustomRenderersFactory(context, audioProcessors, subtitleDelay)
             .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
             .setEnableDecoderFallback(true)
 
@@ -143,6 +151,7 @@ class PlayerFactory {
         trackSelector: DefaultTrackSelector,
         loadControl: DefaultLoadControl,
         renderersFactory: DefaultRenderersFactory,
+        bandwidthMeter: BandwidthMeter,
         dataSourceFactory: DataSource.Factory?,
     ): ExoPlayer {
         val factory = dataSourceFactory ?: DefaultDataSource.Factory(context)
@@ -152,6 +161,7 @@ class PlayerFactory {
             .Builder(context, renderersFactory)
             .experimentalSetDynamicSchedulingEnabled(PlayerConfig.ENABLE_DYNAMIC_SCHEDULING)
             .setTrackSelector(trackSelector)
+            .setBandwidthMeter(bandwidthMeter)
             .setAudioAttributes(
                 AudioAttributes
                     .Builder()
@@ -166,6 +176,9 @@ class PlayerFactory {
             .also {
                 it.setSeekParameters(SeekParameters.CLOSEST_SYNC)
                 it.setWakeMode(C.WAKE_MODE_LOCAL)
+                // Renderer, decoder, surface and stall events under one tag, so a stall can be
+                // timed from logcat instead of argued about (#1298).
+                if (BuildConfig.DEBUG) it.addAnalyticsListener(EventLogger(EVENT_LOG_TAG))
                 Log.d(TAG, "ExoPlayer instance created")
             }
     }

@@ -1,12 +1,12 @@
 /*
  * Copyright (C) 2025-2026 Flow | A-EDev
  *
- * This file is part of Flow (https://github.com/A-EDev/Flow).
+ * This file is part of Flow (https://github.com/Flow-Tube/Flow).
  */
 
 package io.github.aedev.flow.data.recommendation.music
 
-import io.github.aedev.flow.ui.screens.music.MusicTrack
+import io.github.aedev.flow.data.music.model.MusicTrack
 
 /**
  * The Quick Picks lane model, ported from the desktop composer: several
